@@ -1,0 +1,49 @@
+[tool.poetry]
+name = "kaggle_HappyWhale"
+version = "0.1.0"
+description = ""
+authors = [""]
+
+
+[tool.poetry.dependencies]
+python = "^3.7,<3.8"
+numpy = "^1.20"
+poethepoet = "^0.12.0"
+torch =  {url = "https://download.pytorch.org/whl/cu113/torch-1.10.0%2Bcu113-cp37-cp37m-linux_x86_64.whl"}
+pytorch-lightning = "^1.5.10"
+omegaconf = "^2.1.1"
+opencv-python = "^4.5.5"
+joblib = "^1.1.0"
+pandas = "<1.4"
+timm = "^0.5.4"
+scikit-learn = "^1.0.2"
+albumentations = "^1.1.0"
+
+
+[tool.poetry.dev-dependencies]
+black = "^21.12b0"
+mypy = "^0.931"
+flake8 = "^4.0.1"
+isort = "^5.10.1"
+pytest = "^6.2.5"
+jupyterlab = "^3.2.6"
+ipykernel = "^6.6.1"
+tqdm = "^4.62.3"
+jupytext = "^1.13.6"
+autoflake = "^1.4"
+matplotlib = "^3.5.1"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poe.tasks]
+force-cuda11 = "poetry run python3 -m pip install torchvision==0.11.1+cu113 torchaudio==0.10.0+cu113 -f https://download.pytorch.org/whl/cu113/torch_stable.html"
+
+[tool.black]
+max-line-length = 119
+target-version = ["py37"]
+
+[tool.isort]
+line_length = 119
+profile = "black"
