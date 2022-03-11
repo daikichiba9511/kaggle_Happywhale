@@ -95,7 +95,14 @@ config: DictConfig = OmegaConf.create(
             shuffle=False,
             num_workers=4,
             pin_memory=True,
-            drop_last=True
+            drop_last=False
+        ),
+        test_loader=dict(
+            batch_size=4,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+            drop_last=False
         ),
         optimizer=dict(
             name="optim.AdamW",
@@ -250,15 +257,16 @@ class MyLitDataModule(pl.LightningDataModule):
         super().__init__()
         self._train_df = train_df
         self._val_df = val_df
+        self._test_df = test_df
         self._config = config
 
-    def __create_dataset(self, mode: Literal["train", "val"]) -> Dataset:
+    def __create_dataset(self, mode: str) -> Dataset:
         if mode == "train":
             return HappyWhaleDataset(df=self._train_df, transform=get_transform(self._config), mode="train")
         elif mode == "val":
             return HappyWhaleDataset(df=self._val_df,  transform=get_transform(self._config), mode="val")
         elif mode == "test":
-            return HappyWhaleDataset(df=self._val_df,  transform=get_transform(self._config), mode="val")
+            return HappyWhaleDataset(df=self._test_df,  transform=get_transform(self._config), mode="test")
         else:
             raise ValueError
 
@@ -270,6 +278,9 @@ class MyLitDataModule(pl.LightningDataModule):
         dataset = self.__create_dataset(mode="val")
         return DataLoader(dataset, **self._config.val_loader)
 
+    def test_dataloader(self) -> DataLoader:
+        dataset = self.__create_dataset(mode="test")
+        return DataLoader(dataset, **self._config.test_loader)
 
 # =============================
 # Model
@@ -463,19 +474,7 @@ class MyLitModel(pl.LightningModule):
     import argparse
 
 
-def train(fold: int, config: DictConfig) -> None:
-    print("#" * 8 + f"  Fold: {fold}  " + "#" * 8)
-
-    # prepare data
-    le_encoder = LabelEncoder()
-    df = preprocess_df(config, le_encoder)
-
-    train_df = df[df["fold"] != fold]
-    val_df = df[df["fold"] == fold]
-
-    datamodule = MyLitDataModule(train_df, val_df, config)
-    model = MyLitModel(config)
-
+def train(model, datamodule, fold: int, config: DictConfig) -> None:
     # instanciate callbacks
     earystopping = EarlyStopping(
         monitor=config.callbacks.monitor_metric,
@@ -556,13 +555,21 @@ def update_config(config: DictConfig) -> "argparse.NameSpace":
 
 def main(config: DictConfig) -> None:
 
+
     config = update_config(config)
     pprint.pprint(config)
 
-    if config.train:
-        for fold in range(config.n_splits):
-            if fold in config.train_fold:
-                train(fold, config)
+    for fold in range(config.n_splits):
+        # prepare data
+        le_encoder = LabelEncoder()
+        df = preprocess_df(config, le_encoder)
+        train_df = df[df["fold"] != fold]
+        val_df = df[df["fold"] == fold]
+        datamodule = MyLitDataModule(train_df, val_df, config)
+        model = MyLitModel(config)
+        if config.train and fold in config.train_fold:
+            print("#" * 8 + f"  Fold: {fold}  " + "#" * 8)
+            train(model, datamodule, fold, config)
 
     if config.inference:
         # inference関数を実装する
