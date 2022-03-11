@@ -1,14 +1,18 @@
 import os
 import math
 import joblib
+import argparse
+import hashlib
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Optional, Literal
 import pprint
 
 import cv2
 
 import numpy as np
 import pandas as pd
+
+from loguru import logger
 
 import torch
 import torch.nn as nn
@@ -20,15 +24,14 @@ from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 import pytorch_lightning.callbacks as callbacks
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
-from pytorch_lightning.callbacks.progress import ProgressBarBase
-from pytorch_lightning.loggers import TensorBoardLogger
+# from pytorch_lightning.callbacks.progress import ProgressBarBase
+from pytorch_lightning.loggers.wandb import WandbLogger
 from pytorch_lightning.utilities.seed import seed_everything
 
 import timm
 
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import StratifiedKFold
-
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
@@ -49,6 +52,8 @@ config: DictConfig = OmegaConf.create(
         num_classes=15587,
         data_path="./input/happy-whale-and-dolphin",
         output_path="./output",
+        log_path="wandb_logs",
+        wandb_project="",
         model=dict(
             name="tf_efficientnet_b4_ns",
             pretrained=True,
@@ -64,9 +69,19 @@ config: DictConfig = OmegaConf.create(
             accumulate_grad_batches=1,
             progress_bar_refresh_rate=1,
             fast_dev_run=False,
-            num_sanity_val_steps=0,
+            num_sanity_val_steps=3,
             resume_from_checkpoint=None,
             precision=16,
+            limit_train_batches=1.0,
+            limit_val_batches=1.0,
+            limit_test_batches=0.0,
+            check_val_every_n_epoch=1,
+            log_evary_n_steps=10,
+            flush_logs_every_n_steps=10,
+            profiler="simple",
+            deterministic=False,
+            weights_summary="top",
+            reload_dataloaders_every_epoch=True,
         ),
         train_loader=dict(
             batch_size=4,
@@ -94,7 +109,12 @@ config: DictConfig = OmegaConf.create(
                 T_max=500,
             )
         ),
-        loss="nn.CrossEntropyLoss"
+        loss="nn.CrossEntropyLoss",
+        callbacks=dict(
+            monitor_metric="val_loss",
+            mode="min",
+            patience=10,
+        )
     )
 )
 
@@ -144,7 +164,7 @@ def preprocess_df(
     return df
 
 
-def get_transform(config: DictConfig):
+def get_transform(config: DictConfig) -> dict:
     transform = {
         "train": A.Compose(
             [
@@ -181,7 +201,9 @@ def get_transform(config: DictConfig):
 # Data
 # =============================
 class HappyWhaleDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, mode: str, transform=None) -> None:
+    def __init__(
+        self, df: pd.DataFrame, mode: str, transform: Optional[dict] = None
+    ) -> None:
         assert mode in {"train", "val", "test"}
         super().__init__()
         self._df = df
@@ -201,7 +223,7 @@ class HappyWhaleDataset(Dataset):
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return img
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> dict:
         img_path = self._file_names[idx]
         img = self.__get_img(img_path)
         label = self._labels[idx]
@@ -212,6 +234,11 @@ class HappyWhaleDataset(Dataset):
         if not isinstance(img, torch.Tensor):
             img = torch.from_numpy(img)
 
+        if self._mode == "test":
+            return {
+                    "image": img.to(dtype=self._dtype)
+            }
+
         return {
             "image": img.to(dtype=self._dtype),
             "label": torch.tensor(label, dtype=self._dtype)
@@ -219,16 +246,18 @@ class HappyWhaleDataset(Dataset):
 
 
 class MyLitDataModule(pl.LightningDataModule):
-    def __init__(self, train_df: pd.DataFrame, val_df: pd.DataFrame, config: DictConfig) -> None:
+    def __init__(self, train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame, config: DictConfig) -> None:
         super().__init__()
         self._train_df = train_df
         self._val_df = val_df
         self._config = config
 
-    def __create_dataset(self, mode: str):
+    def __create_dataset(self, mode: Literal["train", "val"]) -> Dataset:
         if mode == "train":
             return HappyWhaleDataset(df=self._train_df, transform=get_transform(self._config), mode="train")
         elif mode == "val":
+            return HappyWhaleDataset(df=self._val_df,  transform=get_transform(self._config), mode="val")
+        elif mode == "test":
             return HappyWhaleDataset(df=self._val_df,  transform=get_transform(self._config), mode="val")
         else:
             raise ValueError
@@ -431,6 +460,8 @@ class MyLitModel(pl.LightningModule):
         )
         return [optimizer], [scheduler]
 
+    import argparse
+
 
 def train(fold: int, config: DictConfig) -> None:
     print("#" * 8 + f"  Fold: {fold}  " + "#" * 8)
@@ -446,24 +477,43 @@ def train(fold: int, config: DictConfig) -> None:
     model = MyLitModel(config)
 
     # instanciate callbacks
-    earystopping = EarlyStopping(monitor="val_loss")
+    earystopping = EarlyStopping(
+        monitor=config.callbacks.monitor_metric,
+        patience=config.callbacks.patience,
+        verbose=True,
+        mode=config.callbacks.mode
+    )
     lr_monitor = callbacks.LearningRateMonitor()
     loss_checkpoint = callbacks.ModelCheckpoint(
         dirpath=f"./output/{config.model.name}",
-        filename=f"best_loss_{fold}",
-        monitor="val_loss",
+        filename=f"{config.model.name}" + "-{epoch}-{step}",
+        monitor=config.callbacks.monitor_metric,
         save_top_k=1,
-        mode="min",
-        save_last=False,
+        mode=config.callbacks.mode,
+        save_weights_only=False
     )
 
     # instanciate logger
-    logger = TensorBoardLogger(
-        save_dir="./output/tb_logs", name=f"{config.model.name}"
+    pl_logger = WandbLogger(
+        name=config.model.name + f"_fold{config.n_splits}",
+        save_dir=config.log_path,
+        project=config.wandb_project,
+        version=hashlib.sha224(bytes(str(dict(config)), "utf8")).hexdigest()[:4],
+        anonymous=True,
+        group=config.model.name,
+        # tags=[config.labels]
     )
 
+    # warm start
+    if config.warm_start_path is not None:
+        checkpoint_path = Path(config.checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"{config.checkpoint_path} does not exist")
+        logger.info(checkpoint_path)
+        config.trainer.resume_from_checkpoint = checkpoint_path
+
     trainer = pl.Trainer(
-        logger=logger,
+        logger=pl_logger,
         max_epochs=config.epoch,
         callbacks=[lr_monitor, loss_checkpoint, earystopping],
         **config.trainer,
@@ -471,8 +521,7 @@ def train(fold: int, config: DictConfig) -> None:
     trainer.fit(model, datamodule=datamodule)
 
 
-def update_config(config) -> "argparse.NameSpace":
-    import argparse
+def update_config(config: DictConfig) -> "argparse.NameSpace":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_fold", default=-1, type=int, nargs="*")
@@ -517,7 +566,9 @@ def main(config: DictConfig) -> None:
 
     if config.inference:
         # inference関数を実装する
-        pass
+        checkpoint_path = config.trainer.resume_from_checkpoint
+        state_dict = torch.load(checkpoint_path)["state_dict"]
+        
 
 
 if __name__ == "__main__":
