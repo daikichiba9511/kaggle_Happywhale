@@ -137,11 +137,19 @@ def get_df(config: DictConfig, mode: str = "train") -> pd.DataFrame:
         def _get_train_file_path(idx: str) -> Path:
             return train_img_dir / idx
 
-        df = pd.read_csv(Path(config.data_path) / "train.csv")
-        df.loc[:, "file_path"] = df["image"].map(_get_train_file_path)
+        train_df = pd.read_csv(Path(config.data_path) / "train.csv")
+        train_df.loc[:, "file_path"] = df["image"].map(_get_train_file_path)
         return df
+
     elif mode == "test":
-        return pd.read_csv(Path(config.data_path) / "test.csv")
+        test_img_dir = Path(config.data_path) / "test_images"
+
+        def _get_test_file_path(idx: str) -> Path:
+            return test_img_dir / idx
+
+        test_df = pd.read_csv(Path(config.data_path) / "test.csv")
+        test_df.loc[:, "file_path"] = test_df["image"].map(_get_test_file_path)
+        return test_df
 
     else:
         raise ValueError(f"mode {mode} is not valid")
@@ -160,7 +168,7 @@ def create_folds(df: pd.DataFrame, config: DictConfig) -> pd.DataFrame:
     skf = StratifiedKFold(n_splits=config.n_splits, shuffle=True, random_state=config.seed)
     for fold, (_, val_idx) in enumerate(skf.split(X=df, y=df["individual_id"])):
         df.loc[val_idx, "fold"] = fold
-    df["fold"] = df["fold"].astype(int)
+    df.loc[:, "fold"] = df["fold"].astype(int)
     return df
 
 
@@ -421,7 +429,7 @@ class MyLitModel(pl.LightningModule):
         self.__build_model()
         self.save_hyperparameters(config)
 
-        self._test_preds_df_path = config.
+        self._test_preds_df_path = config.data_path + "/test/test.csv"
 
     def __build_model(self) -> None:
         self.model = HappyWhaleModel(
@@ -511,7 +519,7 @@ def train(model, datamodule, fold: int, config: DictConfig) -> None:
     lr_monitor = callbacks.LearningRateMonitor()
     loss_checkpoint = callbacks.ModelCheckpoint(
         dirpath=f"./output/{config.model.name}",
-        filename=f"{config.model.name}" + "-{epoch}-{step}",
+        filename=f"{config.model.name}" + f"-fold{config.n_splits}-{fold}" + "-{epoch}-{step}",
         monitor=config.callbacks.monitor_metric,
         save_top_k=1,
         mode=config.callbacks.mode,
@@ -546,7 +554,7 @@ def train(model, datamodule, fold: int, config: DictConfig) -> None:
     trainer.fit(model, datamodule=datamodule)
 
 
-def update_config(config: DictConfig) -> "argparse.NameSpace":
+def update_config(config: DictConfig) -> argparse.NameSpace:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_fold", default=-1, type=int, nargs="*")
@@ -558,20 +566,20 @@ def update_config(config: DictConfig) -> "argparse.NameSpace":
 
     if args.train_fold != -1:
         config["train_fold"] = args.train_fold
-        print("train_epoch is specified: ", config["train_fold"])
+        logger.info(f"train_epoch is specified: {config.train_fold}")
 
     if args.tpu:
         config["trainer"]["tpu_cores"] = args.tpu_cores
         config["trainer"].pop("gpus")
-        print("tpu is specified with the number of", config["trainer"]["tpu_cores"])
+        logger.info(f"tpu is specified with the number of {config.trainer.tpu_cores}")
 
     if args.exp:
-        print(" ####### exp mode is called. ####### ")
+        logger.info(" ####### exp mode is called. ####### ")
         config["trainer"]["limit_train_batches"] = 0.5
         config["trainer"]["limit_val_batches"] = 0.5
 
     if args.debug:
-        print(" ####### debug mode is called. ####### ")
+        logger.info(" ####### debug mode is called. ####### ")
         config["trainer"]["limit_train_batches"] = 0.005
         config["trainer"]["limit_val_batches"] = 0.005
         config["epoch"] = 1
@@ -580,8 +588,6 @@ def update_config(config: DictConfig) -> "argparse.NameSpace":
 
 
 def main(config: DictConfig) -> None:
-
-
     config = update_config(config)
     pprint.pprint(config)
 
@@ -589,9 +595,11 @@ def main(config: DictConfig) -> None:
         # prepare data
         le_encoder = LabelEncoder()
         df = preprocess_df(config, le_encoder)
+
         train_df = df[df["fold"] != fold]
         val_df = df[df["fold"] == fold]
         test_df = get_df(config, mode="test")
+
         datamodule = MyLitDataModule(train_df, val_df, test_df, config)
         model = MyLitModel(config)
 
@@ -601,10 +609,14 @@ def main(config: DictConfig) -> None:
 
         if config.inference:
             # inference関数を実装する
-            checkpoint_path = config.trainer.resume_from_checkpoint
+            checkpoint_path = list(
+                (
+                    Path(config.output_path) / config.model.name
+                ).glob(f"{config.model.name}-fold{config.n_splits}-{fold}*")
+            )
             state_dict = torch.load(checkpoint_path)["state_dict"]
             model.load_state_dict(state_dict)
-            params = dict(config.trainer)
+            params = dict(**config.trainer)
             params.update(
                 "gpus": 1,
                 "logger": None,
