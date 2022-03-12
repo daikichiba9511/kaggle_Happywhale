@@ -129,15 +129,22 @@ torch.autograd.set_detect_anomaly(True)
 seed_everything(config.seed)
 
 
-def get_df(config: DictConfig) -> pd.DataFrame:
-    train_img_dir = Path(config.data_path) / "train_images"
+def get_df(config: DictConfig, mode: str = "train") -> pd.DataFrame:
+    assert mode in {"train", "test"}
+    if mode == "train":
+        train_img_dir = Path(config.data_path) / "train_images"
 
-    def _get_train_file_path(idx: str) -> Path:
-        return train_img_dir / idx
+        def _get_train_file_path(idx: str) -> Path:
+            return train_img_dir / idx
 
-    df = pd.read_csv(Path(config.data_path) / "train.csv")
-    df.loc[:, "file_path"] = df["image"].map(_get_train_file_path)
-    return df
+        df = pd.read_csv(Path(config.data_path) / "train.csv")
+        df.loc[:, "file_path"] = df["image"].map(_get_train_file_path)
+        return df
+    elif mode == "test":
+        return pd.read_csv(Path(config.data_path) / "test.csv")
+
+    else:
+        raise ValueError(f"mode {mode} is not valid")
 
 
 def encode_ids(df: pd.DataFrame, config: DictConfig, le_encoder: LabelEncoder, save: bool = False) -> pd.DataFrame:
@@ -414,6 +421,8 @@ class MyLitModel(pl.LightningModule):
         self.__build_model()
         self.save_hyperparameters(config)
 
+        self._test_preds_df_path = config.
+
     def __build_model(self) -> None:
         self.model = HappyWhaleModel(
             model_name=self._config.model.name,
@@ -428,13 +437,17 @@ class MyLitModel(pl.LightningModule):
         loss, pred, labels = self.__share_step(batch, "train")
         return {"loss": loss, "pred": pred, "labels": labels}
 
-    def validation_step(self, batch, batch_idx: int):
+    def validation_step(self, batch: dict, batch_idx: int):
         loss, pred, labels = self.__share_step(batch, "val")
         return {"pred": pred, "labels": labels}
 
-    def __share_step(self, batch, mode):
+    def __share_step(self, batch: dict, mode: str):
         images, labels = batch["image"].to(dtype=self._dtype), batch["label"].to(dtype=torch.long)
-        outputs, emb = self.forward(images, labels)
+        if mode == "train":
+             outputs, emb = self.forward(images, labels)
+        else:
+            with torch.no_grad():
+                outputs, emb = self.forward(images, labels)
         outputs = outputs.to(dtype=self._dtype)
         # print(f"output: {outputs.dtype}, labels: {labels.dtype}")
         # print(f"output: {outputs}, labels: {labels}")
@@ -444,12 +457,22 @@ class MyLitModel(pl.LightningModule):
         labels = labels.detach().cpu()
         return loss, pred, labels
 
+    def test_step(self, batch: dict, batch_idx: int):
+
+        # TOOD: ここのlabelsはダミーだから使わないように修正するか、他の方法を考える
+        images, labels = batch["image"].to(dtype=self._dtype), batch["label"].to(dtype=torch.long)
+        with torch.inference_mode():
+            outputs, _ = self.forward(images, labels)
+        pred = F.softmax(outputs, dims=-1)
+        pred = pred.detach().cpu().numpy()
+        return {"pred": pred}
+
     def training_epoch_end(self, outputs):
         self.__share_epoch_end(outputs, "train")
 
     def validation_epoch_end(self, outputs):
         self.__share_epoch_end(outputs, "val")
-
+    
     def __share_epoch_end(self, outputs, mode):
         preds = []
         labels = []
@@ -462,6 +485,11 @@ class MyLitModel(pl.LightningModule):
         metrics = torch.sqrt(((labels - preds) ** 2).mean())
         self.log(f"{mode}_loss", metrics)
 
+    def test_step_end(self, outputs):
+        preds = np.concatenate([out["pred"] for out in outputs])
+        df = pd.DataFrame({"preds": preds})
+        df.to_csv(self._test_preds_df_path, index=False)
+
     def configure_optimizers(self):
         optimizer = eval(self._config.optimizer.name)(
             self.parameters(), **self._config.optimizer.params
@@ -470,8 +498,6 @@ class MyLitModel(pl.LightningModule):
             optimizer, **self._config.scheduler.params
         )
         return [optimizer], [scheduler]
-
-    import argparse
 
 
 def train(model, datamodule, fold: int, config: DictConfig) -> None:
@@ -565,17 +591,29 @@ def main(config: DictConfig) -> None:
         df = preprocess_df(config, le_encoder)
         train_df = df[df["fold"] != fold]
         val_df = df[df["fold"] == fold]
-        datamodule = MyLitDataModule(train_df, val_df, config)
+        test_df = get_df(config, mode="test")
+        datamodule = MyLitDataModule(train_df, val_df, test_df, config)
         model = MyLitModel(config)
+
         if config.train and fold in config.train_fold:
-            print("#" * 8 + f"  Fold: {fold}  " + "#" * 8)
+            logger.info("#" * 8 + f"  Fold: {fold}  " + "#" * 8)
             train(model, datamodule, fold, config)
 
-    if config.inference:
-        # inference関数を実装する
-        checkpoint_path = config.trainer.resume_from_checkpoint
-        state_dict = torch.load(checkpoint_path)["state_dict"]
-        
+        if config.inference:
+            # inference関数を実装する
+            checkpoint_path = config.trainer.resume_from_checkpoint
+            state_dict = torch.load(checkpoint_path)["state_dict"]
+            model.load_state_dict(state_dict)
+            params = dict(config.trainer)
+            params.update(
+                "gpus": 1,
+                "logger": None,
+                "limit_train_batches": 0.0,
+                "limit_val_batches": 0.0,
+                "limit_test_batches": 1.0,
+            )
+            trainer = pl.Trainer(**params)
+            trainer.test(model, datamodule)
 
 
 if __name__ == "__main__":
