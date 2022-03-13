@@ -4,7 +4,7 @@ import joblib
 import argparse
 import hashlib
 from pathlib import Path
-from typing import Tuple, Optional, Literal
+from typing import Tuple, Optional, List
 import pprint
 
 import cv2
@@ -53,7 +53,7 @@ config: DictConfig = OmegaConf.create(
         data_path="./input/happy-whale-and-dolphin",
         output_path="./output",
         log_path="wandb_logs",
-        wandb_project="",
+        wandb_project="HappyWhale",
         model=dict(
             name="tf_efficientnet_b4_ns",
             pretrained=True,
@@ -127,6 +127,48 @@ config: DictConfig = OmegaConf.create(
 
 torch.autograd.set_detect_anomaly(True)
 seed_everything(config.seed)
+
+
+# ##########
+# Metrics
+# Ref
+# https://www.kaggle.com/pestipeti/explanation-of-map5-scoring-metric
+# ##########
+def map_per_image(label: str, predictions: List[str]) -> float:
+    """Computes the precision score of one image.
+
+    Parameters
+    ----------
+    label : string
+            The true label of the image
+    predictions : list
+            A list of predicted elements (order does matter, 5 predictions allowed per image)
+
+    Returns
+    -------
+    score : double
+    """    
+    try:
+        return 1 / (predictions[:5].index(label) + 1)
+    except ValueError:
+        return 0.0
+
+
+def map_per_set(labels: List[str], predictions: List[List[str]]) -> np.floating:
+    """Computes the average over multiple images.
+
+    Parameters
+    ----------
+    labels : list
+             A list of the true labels. (Only one true label per images allowed!)
+    predictions : list of list
+             A list of predicted elements (order does matter, 5 predictions allowed per image)
+
+    Returns
+    -------
+    score : double
+    """
+    return np.mean([map_per_image(l, p) for l,p in zip(labels, predictions)])
 
 
 def get_df(config: DictConfig, mode: str = "train") -> pd.DataFrame:
@@ -488,9 +530,13 @@ class MyLitModel(pl.LightningModule):
             pred, label = out["pred"], out["labels"]
             preds.append(pred)
             labels.append(label)
-        preds = torch.cat(preds)
-        labels = torch.cat(labels)
-        metrics = torch.sqrt(((labels - preds) ** 2).mean())
+        preds = torch.cat(preds).numpy()
+        labels = torch.cat(labels).numpy()
+        # metrics = torch.sqrt(((labels - preds) ** 2).mean())
+        # (N, num_individual_id)
+        # sort along  wiht num_individual_id descendingly
+        preds = -np.sort(-preds, axis=1)
+        metrics = map_per_set(labels.tolist(), preds.tolist())
         self.log(f"{mode}_loss", metrics)
 
     def test_step_end(self, outputs):
