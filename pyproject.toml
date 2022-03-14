@@ -19,6 +19,7 @@ timm = "^0.5.4"
 scikit-learn = "^1.0.2"
 albumentations = "^1.1.0"
 loguru = "^0.6.0"
+wandb = "^0.12.11"
 
 
 [tool.poetry.dev-dependencies]
@@ -33,13 +34,14 @@ tqdm = "^4.62.3"
 jupytext = "^1.13.6"
 autoflake = "^1.4"
 matplotlib = "^3.5.1"
+pyproject-flake8 = "^0.0.1-alpha.2"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poe.tasks]
-force-cuda11 = "poetry run python3 -m pip install torchvision==0.11.1+cu113 torchaudio==0.10.0+cu113 -f https://download.pytorch.org/whl/cu113/torch_stable.html"
+force-cuda11 = "poetry run python -m pip install torchvision==0.11.1+cu113 torchaudio==0.10.0+cu113 -f https://download.pytorch.org/whl/cu113/torch_stable.html"
 
 [tool.black]
 max-line-length = 119
@@ -48,3 +50,4 @@ target-version = ["py37"]
 [tool.isort]
 line_length = 119
 profile = "black"
+

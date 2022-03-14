@@ -1,43 +1,38 @@
-import os
-import math
-import joblib
 import argparse
 import hashlib
-from pathlib import Path
-from typing import Tuple, Optional, List
+import math
+import os
 import pprint
+from pathlib import Path
+from typing import List, Optional, Tuple
 
+import albumentations as A
 import cv2
-
+import joblib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-
-from loguru import logger
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-from torch.optim import lr_scheduler
-from torch.utils.data import Dataset, DataLoader
-
 import pytorch_lightning as pl
 import pytorch_lightning.callbacks as callbacks
+import timm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from albumentations.pytorch import ToTensorV2
+from loguru import logger
+from omegaconf import OmegaConf
+from omegaconf.dictconfig import DictConfig
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+
 # from pytorch_lightning.callbacks.progress import ProgressBarBase
 from pytorch_lightning.loggers.wandb import WandbLogger
 from pytorch_lightning.utilities.seed import seed_everything
-
-import timm
-
-from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import StratifiedKFold
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-
-from omegaconf import OmegaConf
-from omegaconf.dictconfig import DictConfig
-
+from sklearn.preprocessing import LabelEncoder
+from torch.optim import lr_scheduler
+from torch.utils.data import DataLoader, Dataset
+from typing_extensions import Literal
 
 config: DictConfig = OmegaConf.create(
     dict(
@@ -53,16 +48,12 @@ config: DictConfig = OmegaConf.create(
         data_path="./input/happy-whale-and-dolphin",
         output_path="./output",
         log_path="wandb_logs",
+        warm_start_path=None,
         wandb_project="HappyWhale",
         model=dict(
             name="tf_efficientnet_b4_ns",
             pretrained=True,
-            arc_params=dict(
-                s=30.0,
-                m=0.30,
-                ls_eps=0.0,
-                easy_margin=False
-            )
+            arc_params=dict(s=30.0, m=0.30, ls_eps=0.0, easy_margin=False),
         ),
         trainer=dict(
             gpus=1,
@@ -76,7 +67,6 @@ config: DictConfig = OmegaConf.create(
             limit_val_batches=1.0,
             limit_test_batches=0.0,
             check_val_every_n_epoch=1,
-            log_evary_n_steps=10,
             flush_logs_every_n_steps=10,
             profiler="simple",
             deterministic=False,
@@ -84,44 +74,27 @@ config: DictConfig = OmegaConf.create(
             reload_dataloaders_every_epoch=True,
         ),
         train_loader=dict(
-            batch_size=4,
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True,
-            drop_last=True
+            batch_size=4, shuffle=True, num_workers=4, pin_memory=True, drop_last=True
         ),
         val_loader=dict(
-            batch_size=4,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True,
-            drop_last=False
+            batch_size=4, shuffle=False, num_workers=4, pin_memory=True, drop_last=False
         ),
         test_loader=dict(
-            batch_size=4,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True,
-            drop_last=False
+            batch_size=4, shuffle=False, num_workers=4, pin_memory=True, drop_last=False
         ),
-        optimizer=dict(
-            name="optim.AdamW",
-            params=dict(
-                lr=1e-4
-            )
-        ),
+        optimizer=dict(name="optim.AdamW", params=dict(lr=1e-4)),
         scheduler=dict(
             name="optim.lr_scheduler.CosineAnnealingLR",
             params=dict(
                 T_max=500,
-            )
+            ),
         ),
         loss="nn.CrossEntropyLoss",
         callbacks=dict(
             monitor_metric="val_loss",
             mode="min",
             patience=10,
-        )
+        ),
     )
 )
 
@@ -147,7 +120,7 @@ def map_per_image(label: str, predictions: List[str]) -> float:
     Returns
     -------
     score : double
-    """    
+    """
     try:
         return 1 / (predictions[:5].index(label) + 1)
     except ValueError:
@@ -168,7 +141,15 @@ def map_per_set(labels: List[str], predictions: List[List[str]]) -> np.floating:
     -------
     score : double
     """
-    return np.mean([map_per_image(l, p) for l,p in zip(labels, predictions)])
+    return np.mean(
+        [map_per_image(label, pred) for label, pred in zip(labels, predictions)]
+    )
+
+
+def plot_dist(label: np.ndarray, save_name: str, figsize=(400, 200)) -> None:
+    plt.figure(figsize=figsize)
+    plt.hist(label, label="label")
+    plt.savefig(save_name)
 
 
 def get_df(config: DictConfig, mode: str = "train") -> pd.DataFrame:
@@ -180,8 +161,8 @@ def get_df(config: DictConfig, mode: str = "train") -> pd.DataFrame:
             return train_img_dir / idx
 
         train_df = pd.read_csv(Path(config.data_path) / "train.csv")
-        train_df.loc[:, "file_path"] = df["image"].map(_get_train_file_path)
-        return df
+        train_df.loc[:, "file_path"] = train_df["image"].map(_get_train_file_path)
+        return train_df
 
     elif mode == "test":
         test_img_dir = Path(config.data_path) / "test_images"
@@ -189,7 +170,7 @@ def get_df(config: DictConfig, mode: str = "train") -> pd.DataFrame:
         def _get_test_file_path(idx: str) -> Path:
             return test_img_dir / idx
 
-        test_df = pd.read_csv(Path(config.data_path) / "test.csv")
+        test_df = pd.read_csv(Path(config.data_path) / "sample_submission.csv")
         test_df.loc[:, "file_path"] = test_df["image"].map(_get_test_file_path)
         return test_df
 
@@ -197,7 +178,9 @@ def get_df(config: DictConfig, mode: str = "train") -> pd.DataFrame:
         raise ValueError(f"mode {mode} is not valid")
 
 
-def encode_ids(df: pd.DataFrame, config: DictConfig, le_encoder: LabelEncoder, save: bool = False) -> pd.DataFrame:
+def encode_ids(
+    df: pd.DataFrame, config: DictConfig, le_encoder: LabelEncoder, save: bool = False
+) -> pd.DataFrame:
     df.loc[:, "individual_id"] = le_encoder.fit_transform(df["individual_id"])
     if save:
         pickle_data_path = Path(config.output_path) / "le.pkl"
@@ -207,18 +190,27 @@ def encode_ids(df: pd.DataFrame, config: DictConfig, le_encoder: LabelEncoder, s
 
 
 def create_folds(df: pd.DataFrame, config: DictConfig) -> pd.DataFrame:
-    skf = StratifiedKFold(n_splits=config.n_splits, shuffle=True, random_state=config.seed)
+    skf = StratifiedKFold(
+        n_splits=config.n_splits, shuffle=True, random_state=config.seed
+    )
     for fold, (_, val_idx) in enumerate(skf.split(X=df, y=df["individual_id"])):
         df.loc[val_idx, "fold"] = fold
     df.loc[:, "fold"] = df["fold"].astype(int)
+    logger.info(f"\n {df.fold.value_counts()}")
     return df
 
 
 def preprocess_df(
-    config: DictConfig, le_encoder: LabelEncoder, recache: bool = False, save: bool = True
+    config: DictConfig,
+    le_encoder: LabelEncoder,
+    recache: bool = False,
+    save: bool = True,
 ) -> pd.DataFrame:
-    train_df_path = Path(config.data_path) / f"train-df-fold{config.n_splits}-seed{config.seed}.csv"
+    train_df_path = (
+        Path(config.data_path) / f"train-df-fold{config.n_splits}-seed{config.seed}.csv"
+    )
     if not recache and train_df_path.exists():
+        logger.info(f"cached file is loaded : {train_df_path}")
         df = pd.read_csv(train_df_path)
         return df
 
@@ -238,11 +230,11 @@ def get_transform(config: DictConfig) -> dict:
                     mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225],
                     max_pixel_value=255.0,
-                    p=1.0
+                    p=1.0,
                 ),
-                ToTensorV2()
+                ToTensorV2(),
             ],
-            p=1.0
+            p=1.0,
         ),
         "val": A.Compose(
             [
@@ -251,11 +243,24 @@ def get_transform(config: DictConfig) -> dict:
                     mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225],
                     max_pixel_value=255.0,
-                    p=1.0
+                    p=1.0,
                 ),
-                ToTensorV2()
+                ToTensorV2(),
             ],
-            p=1.0
+            p=1.0,
+        ),
+        "test": A.Compose(
+            [
+                A.Resize(config["img_size"], config["img_size"]),
+                A.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                    max_pixel_value=255.0,
+                    p=1.0,
+                ),
+                ToTensorV2(),
+            ],
+            p=1.0,
         ),
     }
     return transform
@@ -299,18 +304,23 @@ class HappyWhaleDataset(Dataset):
             img = torch.from_numpy(img)
 
         if self._mode == "test":
-            return {
-                    "image": img.to(dtype=self._dtype)
-            }
+            return {"image": img.to(dtype=self._dtype)}
 
         return {
+            "id": idx,
             "image": img.to(dtype=self._dtype),
-            "label": torch.tensor(label, dtype=self._dtype)
+            "label": torch.tensor(label, dtype=self._dtype),
         }
 
 
 class MyLitDataModule(pl.LightningDataModule):
-    def __init__(self, train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame, config: DictConfig) -> None:
+    def __init__(
+        self,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        config: DictConfig,
+    ) -> None:
         super().__init__()
         self._train_df = train_df
         self._val_df = val_df
@@ -319,11 +329,17 @@ class MyLitDataModule(pl.LightningDataModule):
 
     def __create_dataset(self, mode: str) -> Dataset:
         if mode == "train":
-            return HappyWhaleDataset(df=self._train_df, transform=get_transform(self._config), mode="train")
+            return HappyWhaleDataset(
+                df=self._train_df, transform=get_transform(self._config), mode="train"
+            )
         elif mode == "val":
-            return HappyWhaleDataset(df=self._val_df,  transform=get_transform(self._config), mode="val")
+            return HappyWhaleDataset(
+                df=self._val_df, transform=get_transform(self._config), mode="val"
+            )
         elif mode == "test":
-            return HappyWhaleDataset(df=self._test_df,  transform=get_transform(self._config), mode="test")
+            return HappyWhaleDataset(
+                df=self._test_df, transform=get_transform(self._config), mode="test"
+            )
         else:
             raise ValueError
 
@@ -339,17 +355,19 @@ class MyLitDataModule(pl.LightningDataModule):
         dataset = self.__create_dataset(mode="test")
         return DataLoader(dataset, **self._config.test_loader)
 
+
 # =============================
 # Model
 # =============================
 class GeM(nn.Module):
-    """ GeM Pooling
+    """GeM Pooling
 
     Ref:
         * https://www.kaggle.com/vladvdv/pytorch-train-notebook-arcface-gem-pooling#GeM-Pooling
         * https://amaarora.github.io/2020/08/30/gempool.html
 
     """
+
     def __init__(self, p: int = 3, eps: float = 1e-6) -> None:
         super().__init__()
         self._p = nn.Parameter(torch.ones(1) * p)
@@ -358,17 +376,24 @@ class GeM(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.gem(x, p=self._p, eps=self._eps)
 
-    def gem(self, x: torch.Tensor, p: nn.parameter.Parameter, eps: float = 1e-6) -> torch.Tensor:
-        return F.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(1.0 / p)
+    def gem(
+        self, x: torch.Tensor, p: nn.parameter.Parameter, eps: float = 1e-6
+    ) -> torch.Tensor:
+        return F.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(
+            1.0 / p
+        )
 
     def __repr__(self) -> str:
-        return self.__class__.__name__ + \
-                "(" + f"p={self._p.data.tolist()[0]:.4f}" + \
-                f",eps={self.eps})"
+        return (
+            self.__class__.__name__
+            + "("
+            + f"p={self._p.data.tolist()[0]:.4f}"
+            + f",eps={self.eps})"
+        )
 
 
 class ArcMarginProduct(nn.Module):
-    """ Implement of large margin arc distance
+    """Implement of large margin arc distance
 
     Args:
         in_features: size of each input sample
@@ -380,6 +405,7 @@ class ArcMarginProduct(nn.Module):
         https://www.kaggle.com/vladvdv/pytorch-train-notebook-arcface-gem-pooling#ArcFace
         https://github.com/lyakaap/Landmark2019-1st-and-3rd-Place-Solution/blob/master/src/modeling/metric_learning.py
     """
+
     def __init__(
         self,
         in_features: int,
@@ -388,7 +414,7 @@ class ArcMarginProduct(nn.Module):
         s: float = 30.0,
         m: float = 0.50,
         easy_margin: bool = False,
-        ls_eps: float = 0.0
+        ls_eps: float = 0.0,
     ) -> None:
         super().__init__()
         self.in_featurs = in_features
@@ -433,7 +459,9 @@ class ArcMarginProduct(nn.Module):
 
 
 class HappyWhaleModel(nn.Module):
-    def __init__(self, model_name: str, config: DictConfig, pretrained: bool = True) -> None:
+    def __init__(
+        self, model_name: str, config: DictConfig, pretrained: bool = True
+    ) -> None:
         super().__init__()
         self.backbone = timm.create_model(model_name, pretrained=pretrained)
         in_features = self.backbone.classifier.in_features
@@ -449,10 +477,12 @@ class HappyWhaleModel(nn.Module):
             s=config.model.arc_params.s,
             m=config.model.arc_params.m,
             easy_margin=config.model.arc_params.easy_margin,
-            ls_eps=config.model.arc_params.ls_eps
+            ls_eps=config.model.arc_params.ls_eps,
         )
 
-    def forward(self, images: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, images: torch.Tensor, labels: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         features = self.backbone(images)
         pooled_features = self.pooling(features).flatten(1)
         pooled_drop = self.drop(pooled_features)
@@ -480,7 +510,9 @@ class MyLitModel(pl.LightningModule):
             pretrained=self._config.model.pretrained,
         )
 
-    def forward(self, images: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, images: torch.Tensor, labels: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.model(images, labels)
 
     def training_step(self, batch, batch_idx: int):
@@ -492,9 +524,11 @@ class MyLitModel(pl.LightningModule):
         return {"pred": pred, "labels": labels}
 
     def __share_step(self, batch: dict, mode: str):
-        images, labels = batch["image"].to(dtype=self._dtype), batch["label"].to(dtype=torch.long)
+        images, labels = batch["image"].to(dtype=self._dtype), batch["label"].to(
+            dtype=torch.long
+        )
         if mode == "train":
-             outputs, emb = self.forward(images, labels)
+            outputs, emb = self.forward(images, labels)
         else:
             with torch.no_grad():
                 outputs, emb = self.forward(images, labels)
@@ -503,27 +537,29 @@ class MyLitModel(pl.LightningModule):
         # print(f"output: {outputs}, labels: {labels}")
         loss = self._criterion(outputs, labels)
 
-        pred = outputs.sigmoid(dim=1).detach().cpu()
+        pred = outputs.sigmoid().detach().cpu()
         labels = labels.detach().cpu()
         return loss, pred, labels
 
     def test_step(self, batch: dict, batch_idx: int):
 
         # TOOD: ここのlabelsはダミーだから使わないように修正するか、他の方法を考える
-        images, labels = batch["image"].to(dtype=self._dtype), batch["label"].to(dtype=torch.long)
+        images, labels = batch["image"].to(dtype=self._dtype), batch["label"].to(
+            dtype=torch.long
+        )
         with torch.inference_mode():
             outputs, _ = self.forward(images, labels)
         pred = F.softmax(outputs, dims=-1)
         pred = pred.detach().cpu().numpy()
         return {"pred": pred}
 
-    def training_epoch_end(self, outputs):
+    def training_epoch_end(self, outputs: dict) -> None:
         self.__share_epoch_end(outputs, "train")
 
-    def validation_epoch_end(self, outputs):
+    def validation_epoch_end(self, outputs: dict) -> None:
         self.__share_epoch_end(outputs, "val")
-    
-    def __share_epoch_end(self, outputs, mode):
+
+    def __share_epoch_end(self, outputs: dict, mode: Literal["train", "val"]) -> None:
         preds = []
         labels = []
         for out in outputs:
@@ -535,7 +571,8 @@ class MyLitModel(pl.LightningModule):
         # metrics = torch.sqrt(((labels - preds) ** 2).mean())
         # (N, num_individual_id)
         # sort along  wiht num_individual_id descendingly
-        preds = -np.sort(-preds, axis=1)
+        # preds = -np.sort(-preds, axis=1)
+        preds = preds.argmax()
         metrics = map_per_set(labels.tolist(), preds.tolist())
         self.log(f"{mode}_loss", metrics)
 
@@ -560,16 +597,18 @@ def train(model, datamodule, fold: int, config: DictConfig) -> None:
         monitor=config.callbacks.monitor_metric,
         patience=config.callbacks.patience,
         verbose=True,
-        mode=config.callbacks.mode
+        mode=config.callbacks.mode,
     )
     lr_monitor = callbacks.LearningRateMonitor()
     loss_checkpoint = callbacks.ModelCheckpoint(
         dirpath=f"./output/{config.model.name}",
-        filename=f"{config.model.name}" + f"-fold{config.n_splits}-{fold}" + "-{epoch}-{step}",
+        filename=f"{config.model.name}"
+        + f"-fold{config.n_splits}-{fold}"
+        + "-{epoch}-{step}",
         monitor=config.callbacks.monitor_metric,
         save_top_k=1,
         mode=config.callbacks.mode,
-        save_weights_only=False
+        save_weights_only=False,
     )
 
     # instanciate logger
@@ -600,7 +639,7 @@ def train(model, datamodule, fold: int, config: DictConfig) -> None:
     trainer.fit(model, datamodule=datamodule)
 
 
-def update_config(config: DictConfig) -> argparse.NameSpace:
+def update_config(config: DictConfig) -> DictConfig:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_fold", default=-1, type=int, nargs="*")
@@ -646,6 +685,11 @@ def main(config: DictConfig) -> None:
         val_df = df[df["fold"] == fold]
         test_df = get_df(config, mode="test")
 
+        plot_dist(
+            label=val_df["individual_id"].values,
+            save_name=config.output_path + f"/fold{fold}-dist.png",
+        )
+
         datamodule = MyLitDataModule(train_df, val_df, test_df, config)
         model = MyLitModel(config)
 
@@ -656,22 +700,26 @@ def main(config: DictConfig) -> None:
         if config.inference:
             # inference関数を実装する
             checkpoint_path = list(
-                (
-                    Path(config.output_path) / config.model.name
-                ).glob(f"{config.model.name}-fold{config.n_splits}-{fold}*")
+                (Path(config.output_path) / config.model.name).glob(
+                    f"{config.model.name}-fold{config.n_splits}-{fold}*"
+                )
             )
             state_dict = torch.load(checkpoint_path)["state_dict"]
             model.load_state_dict(state_dict)
             params = dict(**config.trainer)
             params.update(
-                "gpus": 1,
-                "logger": None,
-                "limit_train_batches": 0.0,
-                "limit_val_batches": 0.0,
-                "limit_test_batches": 1.0,
+                {
+                    "gpus": 1,
+                    "logger": None,
+                    "limit_train_batches": 0.0,
+                    "limit_val_batches": 0.0,
+                    "limit_test_batches": 1.0,
+                }
             )
+
             trainer = pl.Trainer(**params)
             trainer.test(model, datamodule)
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

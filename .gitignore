@@ -131,3 +131,5 @@ dmypy.json
 input
 output
 .devcontainer
+
+wandb_logs
