@@ -6,8 +6,7 @@ setup: ## setup package on kaggle docker image
 	python --version \
 	&& python -m pip install --upgrade pip \
 	&& python -m pip install poetry \
-	&& poetry install \
-	&& poe force-cuda11
+	&& poetry install 
 
 set_tpu:
 	${POETRY} \

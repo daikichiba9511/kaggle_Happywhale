@@ -4,8 +4,9 @@ import math
 import os
 import pprint
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
+import faiss
 import albumentations as A
 import cv2
 import joblib
@@ -29,7 +30,7 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.loggers.wandb import WandbLogger
 from pytorch_lightning.utilities.seed import seed_everything
 from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, normalize
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader, Dataset
 from typing_extensions import Literal
@@ -41,7 +42,6 @@ config: DictConfig = OmegaConf.create(
         inference=False,
         device="cuda" if torch.cuda.is_available() else "cpu",
         seed=2022,
-        epocs=50,
         img_size=768,
         n_splits=5,
         num_classes=15587,
@@ -53,7 +53,8 @@ config: DictConfig = OmegaConf.create(
         model=dict(
             name="tf_efficientnet_b4_ns",
             pretrained=True,
-            arc_params=dict(s=30.0, m=0.30, ls_eps=0.0, easy_margin=False),
+            embedding_size=512,
+            arc_params=dict(s=20.0, m=0.50, ls_eps=0.0, easy_margin=False),
         ),
         trainer=dict(
             gpus=1,
@@ -72,6 +73,10 @@ config: DictConfig = OmegaConf.create(
             deterministic=False,
             weights_summary="top",
             reload_dataloaders_every_epoch=True,
+            auto_scale_batch_size=True,
+            auto_lr_find=False,
+            max_epochs=50,
+            stochastic_weight_avg=True,
         ),
         train_loader=dict(
             batch_size=4, shuffle=True, num_workers=4, pin_memory=True, drop_last=True
@@ -82,7 +87,7 @@ config: DictConfig = OmegaConf.create(
         test_loader=dict(
             batch_size=4, shuffle=False, num_workers=4, pin_memory=True, drop_last=False
         ),
-        optimizer=dict(name="optim.AdamW", params=dict(lr=1e-4)),
+        optimizer=dict(name="optim.AdamW", params=dict(lr=3e-4)),
         scheduler=dict(
             name="optim.lr_scheduler.CosineAnnealingLR",
             params=dict(
@@ -101,6 +106,9 @@ config: DictConfig = OmegaConf.create(
 torch.autograd.set_detect_anomaly(True)
 seed_everything(config.seed)
 
+# ============
+# Functions
+# ============
 
 # ##########
 # Metrics
@@ -146,7 +154,9 @@ def map_per_set(labels: List[str], predictions: List[List[str]]) -> np.floating:
     )
 
 
-def plot_dist(label: np.ndarray, save_name: str, figsize=(400, 200)) -> None:
+def plot_dist(
+    label: np.ndarray, save_name: str, figsize: Tuple[int, int] = (400, 200)
+) -> None:
     plt.figure(figsize=figsize)
     plt.hist(label, label="label")
     plt.savefig(save_name)
@@ -162,6 +172,15 @@ def get_df(config: DictConfig, mode: str = "train") -> pd.DataFrame:
 
         train_df = pd.read_csv(Path(config.data_path) / "train.csv")
         train_df.loc[:, "file_path"] = train_df["image"].map(_get_train_file_path)
+        train_df["species"].replace(
+            {
+                "globis": "short_finned_pilot_whale",
+                "pilot_whale": "short_finned_pilot_whale",
+                "kiler_whale": "killer_whale",
+                "bottlenose_dolpin": "bottlenose_dolphin",
+            },
+            inplace=True,
+        )
         return train_df
 
     elif mode == "test":
@@ -172,6 +191,7 @@ def get_df(config: DictConfig, mode: str = "train") -> pd.DataFrame:
 
         test_df = pd.read_csv(Path(config.data_path) / "sample_submission.csv")
         test_df.loc[:, "file_path"] = test_df["image"].map(_get_test_file_path)
+        test_df.loc[:, "dummy_labels"] = 0
         return test_df
 
     else:
@@ -266,6 +286,185 @@ def get_transform(config: DictConfig) -> dict:
     return transform
 
 
+# ==================
+# infer funcs
+# ==================
+def get_predictions(
+    test_df: pd.DataFrame, threshold: float = 0.2
+) -> Dict[str, List[str]]:
+    predictions: Dict[str, List[str]] = {}
+    images = test_df["image"]
+    targets = test_df["target"]
+    distances = test_df["distances"]
+    for image, target, distance in zip(images, targets, distances):
+        if image in predictions:
+            if len(predictions[image]) < 5:
+                predictions[image].append(target)
+        elif distance > threshold:
+            predictions[image] = [target, "new_individual"]
+
+        else:
+            predictions[image] = ["new_individual", target]
+
+    # validation + post process
+    sample_list = [
+        "938b7e931166",
+        "5bf17305f073",
+        "7593d2aee842",
+        "7362d7a01d00",
+        "956562ff2888",
+    ]
+    for key in predictions:
+        if len(predictions[key]) < 5:
+            remaining = [y for y in sample_list if y not in predictions]
+            tmp_preds = predictions[key] + remaining
+            predictions[key] = tmp_preds[:5]
+
+    return predictions
+
+
+# Ref
+# https://www.kaggle.com/clemchris/pytorch-lightning-arcface-train-infer/notebook
+def load_module(checkpoint_path: str, device: torch.device, config: DictConfig):
+    module = MyLitModel.load_from_checkpoint(checkpoint_path, config=config)
+    module.to(device)
+    module.eval()
+    return module
+
+
+def load_dataloaders(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    config: DictConfig,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    datamodule = MyLitDataModule(train_df, val_df, test_df, config)
+    train_loader = datamodule.train_dataloader()
+    val_loader = datamodule.val_dataloader()
+    test_loader = datamodule.test_loader()
+    return train_loader, val_loader, test_loader
+
+
+def load_encoder(le_path: str) -> LabelEncoder:
+    with open(le_path, "rb") as f:
+        le = joblib.load(f)
+    return le
+
+
+@torch.inference_mode()
+def get_embeddings(
+    module: pl.LightningModule, dataloader: DataLoader, encoder: LabelEncoder
+):
+    all_img_names = []
+    all_embeddings = []
+    all_labels = []
+    for batch in dataloader:
+        img_name = batch["image_path"]
+        imgs = batch["image"].to(module.device)
+        labels = batch["label"].to(module.device)
+
+        _, emb = module(imgs, labels)
+
+        all_img_names.append(img_name)
+        all_embeddings.apppend(emb.cpu().numpy())
+        all_labels.append(labels.cpu().numpy())
+
+    all_img_names = np.concatenate(all_img_names)
+    all_embeddings = np.vstack(all_embeddings)
+    all_labels = np.concatenate(all_labels)
+
+    all_embeddings = normalize(all_embeddings, axis=1, norm="l2")
+    all_labels = encoder.inverse_transform(all_labels)
+    return all_img_names, all_embeddings, all_labels
+
+
+def create_val_targets_df(
+    train_targets: np.ndarray, val_image_names: np.ndarray, val_targets: np.ndarray
+) -> pd.DataFrame:
+
+    allowed_targets = np.unique(train_targets)
+    val_targets_df = pd.DataFrame(
+        np.stack([val_image_names, val_targets], axis=1), columns=["image", "target"]
+    )
+    val_targets_df.loc[
+        ~val_targets_df.target.isin(allowed_targets), "target"
+    ] = "new_individual"
+
+    return val_targets_df
+
+
+def create_and_search_index(
+    embedding_size: int,
+    train_embeddings: np.ndarray,
+    val_embeddings: np.ndarray,
+    k: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    index = faiss.IndexFlatIP(embedding_size)
+    index.add(train_embeddings)
+    D, I = index.search(val_embeddings, k=k)
+    return D, I
+
+
+def create_distances_df(
+    image_names: np.ndarray, labels: np.ndarray, D: np.ndarray, I: np.ndarray
+) -> pd.DataFrame:
+    distance_df = []
+    for i, image_name in enumerate(image_names):
+        label = labels[I[i]]
+        distances = D[i]
+        subset_preds = {"label": label, "distances": distances, "image": image_name}
+        distance_df.append(subset_preds)
+
+    distance_df = pd.DataFrame(distance_df).reset_index(drop=True)
+    distance_df = (
+        distance_df.groupby(["image", "labels"])["distances"]
+        .max()
+        .reset_index(drop=True)
+    )
+    distance_df = distance_df.sort_values("distances", ascending=False).reset_index(
+        drop=True
+    )
+    return distance_df
+
+
+def get_best_threshold(
+    val_targets_df: pd.DataFrame, val_df: pd.DataFrame
+) -> Tuple[float, float]:
+    best_thr = 0
+    best_cv = 0
+    for thr in np.arange(0.1, 0.9, 0.1):
+        all_preds = get_predictions(val_df, threshold=thr)
+
+        cv = map_per_set(val_targets_df["labels"], all_preds)
+
+        logger.info(f"thr={thr}, cv={cv}")
+        if cv > best_cv:
+            best_cv = cv
+            best_thr = thr
+
+    logger.info(f"######### best_thr={best_thr}, best_cv={best_cv} ########## ")
+
+    # Adjustment: Since Public lb has nearly 10% 'new_individual' (Be Careful for private LB)
+    val_targets_df.loc[:, "is_new_individual"] = (
+        val_targets_df["target"] == "new_individual"
+    )
+    val_scores = val_targets_df.groupby("is_new_individual").mean().T
+    val_scores.loc[:, "adjusted_cv"] = val_scores[True] * 0.1 + val_scores[False] * 0.9
+    best_thr = val_scores["adjusted_cv"].idxmax()
+    logger.info(f"best_thr_adjusted={best_thr}")
+    return best_thr, best_cv
+
+
+def create_predictions_df(test_df: pd.DataFrame, best_thr: float) -> pd.DataFrame:
+    predictions = get_predictions(test_df, best_thr)
+    predictions = pd.Series(predictions).reset_index()
+    predictions.columns = ["image", "predictions"]
+    predictions.loc[:, "predictions"] = predictions["predictions"].map(
+        lambda x: " ".join(x)
+    )
+    return predictions
+
+
 # =============================
 # Data
 # =============================
@@ -276,8 +475,12 @@ class HappyWhaleDataset(Dataset):
         assert mode in {"train", "val", "test"}
         super().__init__()
         self._df = df
+        self._images = df["image"].values
         self._file_names = df["file_path"].values
-        self._labels = df["individual_id"].values
+        if mode == "test":
+            self._labels = df["dummy_labels"].values
+        else:
+            self._labels = df["individual_id"].values
 
         self._mode = mode
         self._transform = transform
@@ -294,6 +497,7 @@ class HappyWhaleDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         img_path = self._file_names[idx]
+        org_img_path = self._images[idx]
         img = self.__get_img(img_path)
         label = self._labels[idx]
 
@@ -303,11 +507,9 @@ class HappyWhaleDataset(Dataset):
         if not isinstance(img, torch.Tensor):
             img = torch.from_numpy(img)
 
-        if self._mode == "test":
-            return {"image": img.to(dtype=self._dtype)}
-
         return {
             "id": idx,
+            "image_path": org_img_path,
             "image": img.to(dtype=self._dtype),
             "label": torch.tensor(label, dtype=self._dtype),
         }
@@ -460,7 +662,10 @@ class ArcMarginProduct(nn.Module):
 
 class HappyWhaleModel(nn.Module):
     def __init__(
-        self, model_name: str, config: DictConfig, pretrained: bool = True
+        self,
+        model_name: str,
+        config: DictConfig,
+        pretrained: bool = True,
     ) -> None:
         super().__init__()
         self.backbone = timm.create_model(model_name, pretrained=pretrained)
@@ -469,7 +674,7 @@ class HappyWhaleModel(nn.Module):
         self.backbone.global_pool = nn.Identity()
         self.pooling = GeM()
         self.drop = nn.Dropout(p=0.2, inplace=False)
-        self.fc = nn.Linear(in_features, 512)
+        self.fc = nn.Linear(in_features, config.model.embedding_size)
         self.arc = ArcMarginProduct(
             512,
             config.num_classes,
@@ -495,12 +700,14 @@ class MyLitModel(pl.LightningModule):
     def __init__(self, config: DictConfig) -> None:
         super().__init__()
         self._config = config
+        self.batch_size = config.train_loader.batch_size
         self._criterion = eval(config.loss)()
         self._transform = get_transform(config)
         self._dtype = torch.float if config.trainer.precision == 32 else torch.half
         self.__build_model()
         self.save_hyperparameters(config)
 
+        self._le = self.__load_le()
         self._test_preds_df_path = config.data_path + "/test/test.csv"
 
     def __build_model(self) -> None:
@@ -510,23 +717,42 @@ class MyLitModel(pl.LightningModule):
             pretrained=self._config.model.pretrained,
         )
 
+    def __load_le(self) -> LabelEncoder:
+        with open(self._config.output_path + "/le.pkl", "rb") as f:
+            le = joblib.load(f)
+        return le
+
     def forward(
         self, images: torch.Tensor, labels: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.model(images, labels)
 
-    def training_step(self, batch, batch_idx: int):
-        loss, pred, labels = self.__share_step(batch, "train")
-        return {"loss": loss, "pred": pred, "labels": labels}
+    def training_step(self, batch: dict, batch_idx: int) -> dict:
+        loss, pred, labels, img_path, idx, emb = self.__share_step(batch, "train")
+        return {
+            "loss": loss,
+            "pred": pred,
+            "labels": labels,
+            "image_path": img_path,
+            "ids": idx,
+            "emb": emb,
+        }
 
-    def validation_step(self, batch: dict, batch_idx: int):
-        loss, pred, labels = self.__share_step(batch, "val")
-        return {"pred": pred, "labels": labels}
+    def validation_step(self, batch: dict, batch_idx: int) -> dict:
+        loss, pred, labels, img_path, idx, emb = self.__share_step(batch, "val")
+        return {
+            "pred": pred,
+            "labels": labels,
+            "image_path": img_path,
+            "ids": idx,
+            "emb": emb,
+        }
 
     def __share_step(self, batch: dict, mode: str):
         images, labels = batch["image"].to(dtype=self._dtype), batch["label"].to(
             dtype=torch.long
         )
+        img_path, idx = batch["image_path"], batch["id"]
         if mode == "train":
             outputs, emb = self.forward(images, labels)
         else:
@@ -538,20 +764,22 @@ class MyLitModel(pl.LightningModule):
         loss = self._criterion(outputs, labels)
 
         pred = outputs.sigmoid().detach().cpu()
+        emb = emb.detach().cpu()
         labels = labels.detach().cpu()
-        return loss, pred, labels
+        return loss, pred, labels, img_path, idx, emb
 
     def test_step(self, batch: dict, batch_idx: int):
+        (images,) = batch["image"].to(dtype=self._dtype)
+        labels = batch["label"].to(dtype=torch.long)
+        img_path, idx = batch["image_path"], batch["id"]
 
-        # TOOD: ここのlabelsはダミーだから使わないように修正するか、他の方法を考える
-        images, labels = batch["image"].to(dtype=self._dtype), batch["label"].to(
-            dtype=torch.long
-        )
         with torch.inference_mode():
-            outputs, _ = self.forward(images, labels)
+            outputs, emb = self.forward(images, labels)
+
         pred = F.softmax(outputs, dims=-1)
         pred = pred.detach().cpu().numpy()
-        return {"pred": pred}
+        emb = emb.dettach().cpu().numpy()
+        return {"pred": pred, "image_path": img_path, "id": idx, "emb": emb}
 
     def training_epoch_end(self, outputs: dict) -> None:
         self.__share_epoch_end(outputs, "train")
@@ -566,24 +794,27 @@ class MyLitModel(pl.LightningModule):
             pred, label = out["pred"], out["labels"]
             preds.append(pred)
             labels.append(label)
-        preds = torch.cat(preds).numpy()
-        labels = torch.cat(labels).numpy()
-        # metrics = torch.sqrt(((labels - preds) ** 2).mean())
-        # (N, num_individual_id)
-        # sort along  wiht num_individual_id descendingly
-        # preds = -np.sort(-preds, axis=1)
-        preds = preds.argmax()
-        metrics = map_per_set(labels.tolist(), preds.tolist())
-        self.log(f"{mode}_loss", metrics)
+
+        preds = torch.cat(preds)
+        labels = torch.cat(labels)
+        loss = F.cross_entropy(preds.float(), labels.long())
+        self.log(f"{mode}_loss", loss)
 
     def test_step_end(self, outputs):
+        # TODO: 予測を本来のラベルにもどす
         preds = np.concatenate([out["pred"] for out in outputs])
-        df = pd.DataFrame({"preds": preds})
+        image_paths = np.concatenate([out["image_path"] for out in outputs])
+        embs = np.vstack([out["emb"] for out in outputs])
+        embs = normalize(embs, axis=1, norm="l2")
+
+        df = pd.DataFrame({"predictions": preds, "image": image_paths})
+        df.loc[:, "predictions"] = df["predictions"].map(lambda x: " ".join(x))
         df.to_csv(self._test_preds_df_path, index=False)
 
     def configure_optimizers(self):
         optimizer = eval(self._config.optimizer.name)(
-            self.parameters(), **self._config.optimizer.params
+            self.parameters(),
+            **self._config.optimizer.params,
         )
         scheduler = eval(self._config.scheduler.name)(
             optimizer, **self._config.scheduler.params
@@ -632,11 +863,62 @@ def train(model, datamodule, fold: int, config: DictConfig) -> None:
 
     trainer = pl.Trainer(
         logger=pl_logger,
-        max_epochs=config.epoch,
         callbacks=[lr_monitor, loss_checkpoint, earystopping],
         **config.trainer,
     )
+    trainer.tune(model, datamodule=datamodule)
     trainer.fit(model, datamodule=datamodule)
+
+
+def infer(
+    checkpoint_path: str,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    img_size: Tuple[int, int],
+    batch_size: int,
+    config: DictConfig,
+    k: int = 50,
+):
+    module = load_module(checkpoint_path, torch.device("cuda"), config)
+
+    train_loader, val_loader, test_loader = load_dataloaders(
+        train_df, val_df, test_df, config
+    )
+
+    encoder = load_encoder(config.output_path + "/le.pkl")
+
+    train_img_names, train_embs, train_labels = get_embeddings(
+        module, train_loader, encoder
+    )
+    val_img_name, val_embs, val_labels = get_embeddings(module, val_loader, encoder)
+    test_img_name, test_embs, test_labels = get_embeddings(module, test_loader, encoder)
+
+    D, I = create_and_search_index(
+        module.hparams.embeddings_size, train_embs, val_embs, k
+    )
+
+    val_targets_df = create_val_targets_df(train_labels, val_img_name, val_labels)
+    val_df = create_distances_df(val_img_name, train_labels, D, I)
+    best_thr, best_cv = get_best_threshold(val_targets_df, val_df)
+
+    train_embs = np.concatenate([train_embs, val_embs])
+    train_labels = np.concatenate([train_labels, val_labels])
+
+    D, I = create_and_search_index(
+        module.hparams.embeddings_size, train_embs, test_embs, k
+    )
+    test_df = create_distances_df(test_img_name, train_labels, D, I)
+    predictions = create_predictions_df(test_df, best_thr)
+
+    logger.info(f"prediciotns_df \n{predictions.head()}")
+
+    # make submission
+    submission_csv_path = (
+        Path(config.output_path) / str(Path(__file__).stem) / "submission.csv"
+    )
+    submission_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    predictions.to_csv(submission_csv_path, index=False)
 
 
 def update_config(config: DictConfig) -> DictConfig:
@@ -667,7 +949,7 @@ def update_config(config: DictConfig) -> DictConfig:
         logger.info(" ####### debug mode is called. ####### ")
         config["trainer"]["limit_train_batches"] = 0.005
         config["trainer"]["limit_val_batches"] = 0.005
-        config["epoch"] = 1
+        config["trainer"]["max_epochs"] = 1
 
     return config
 
