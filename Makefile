@@ -8,6 +8,9 @@ setup: ## setup package on kaggle docker image
 	&& python -m pip install poetry \
 	&& poetry install 
 
+poe:
+	poe force-cuda11 && poe faiss
+
 set_tpu:
 	${POETRY} \
 	&& poetry config virtualenvs.create false --local \

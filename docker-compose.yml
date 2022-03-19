@@ -3,8 +3,8 @@ services:
   local:
     build:
       context: .
-      shm_size: '60gb' 
       dockerfile: ./Dockerfile
+    shm_size: 60g
     image: local-dev-for-kaggle
     container_name: local-container-for-kaggle
     tty: true

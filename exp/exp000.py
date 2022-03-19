@@ -6,6 +6,7 @@ import pprint
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from tqdm.auto import tqdm
 import faiss
 import albumentations as A
 import cv2
@@ -38,11 +39,12 @@ from typing_extensions import Literal
 config: DictConfig = OmegaConf.create(
     dict(
         train=True,
+        debug=False,
         train_fold=[0, 1, 2, 3, 4],
-        inference=False,
+        inference=True,
         device="cuda" if torch.cuda.is_available() else "cpu",
         seed=2022,
-        img_size=768,
+        img_size=224,
         n_splits=5,
         num_classes=15587,
         data_path="./input/happy-whale-and-dolphin",
@@ -70,22 +72,31 @@ config: DictConfig = OmegaConf.create(
             check_val_every_n_epoch=1,
             flush_logs_every_n_steps=10,
             profiler="simple",
-            deterministic=False,
+            deterministic=True,
+            benchmark=False,
             weights_summary="top",
             reload_dataloaders_every_epoch=True,
-            auto_scale_batch_size=True,
+            auto_scale_batch_size=False,
             auto_lr_find=False,
             max_epochs=50,
-            stochastic_weight_avg=True,
+            stochastic_weight_avg=False,
         ),
         train_loader=dict(
-            batch_size=4, shuffle=True, num_workers=4, pin_memory=True, drop_last=True
+            batch_size=128, shuffle=True, num_workers=2, pin_memory=True, drop_last=True
         ),
         val_loader=dict(
-            batch_size=4, shuffle=False, num_workers=4, pin_memory=True, drop_last=False
+            batch_size=128,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+            drop_last=False,
         ),
         test_loader=dict(
-            batch_size=4, shuffle=False, num_workers=4, pin_memory=True, drop_last=False
+            batch_size=128,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+            drop_last=False,
         ),
         optimizer=dict(name="optim.AdamW", params=dict(lr=3e-4)),
         scheduler=dict(
@@ -294,7 +305,7 @@ def get_predictions(
 ) -> Dict[str, List[str]]:
     predictions: Dict[str, List[str]] = {}
     images = test_df["image"]
-    targets = test_df["target"]
+    targets = test_df["label"]
     distances = test_df["distances"]
     for image, target, distance in zip(images, targets, distances):
         if image in predictions:
@@ -326,8 +337,9 @@ def get_predictions(
 # Ref
 # https://www.kaggle.com/clemchris/pytorch-lightning-arcface-train-infer/notebook
 def load_module(checkpoint_path: str, device: torch.device, config: DictConfig):
+    dtype = torch.float if config.trainer.precision == 32 else torch.half
     module = MyLitModel.load_from_checkpoint(checkpoint_path, config=config)
-    module.to(device)
+    module.to(device, dtype=dtype)
     module.eval()
     return module
 
@@ -341,7 +353,7 @@ def load_dataloaders(
     datamodule = MyLitDataModule(train_df, val_df, test_df, config)
     train_loader = datamodule.train_dataloader()
     val_loader = datamodule.val_dataloader()
-    test_loader = datamodule.test_loader()
+    test_loader = datamodule.test_dataloader()
     return train_loader, val_loader, test_loader
 
 
@@ -358,20 +370,20 @@ def get_embeddings(
     all_img_names = []
     all_embeddings = []
     all_labels = []
-    for batch in dataloader:
+    for batch in tqdm(dataloader):
         img_name = batch["image_path"]
-        imgs = batch["image"].to(module.device)
-        labels = batch["label"].to(module.device)
+        imgs = batch["image"].to(module.device, dtype=torch.half)
+        labels = batch["label"].to(module.device, dtype=torch.long)
 
         _, emb = module(imgs, labels)
 
         all_img_names.append(img_name)
-        all_embeddings.apppend(emb.cpu().numpy())
+        all_embeddings.append(emb.cpu().numpy())
         all_labels.append(labels.cpu().numpy())
 
     all_img_names = np.concatenate(all_img_names)
-    all_embeddings = np.vstack(all_embeddings)
-    all_labels = np.concatenate(all_labels)
+    all_embeddings = np.vstack(all_embeddings).astype("f4")
+    all_labels = np.concatenate(all_labels).astype("i4")
 
     all_embeddings = normalize(all_embeddings, axis=1, norm="l2")
     all_labels = encoder.inverse_transform(all_labels)
@@ -384,10 +396,10 @@ def create_val_targets_df(
 
     allowed_targets = np.unique(train_targets)
     val_targets_df = pd.DataFrame(
-        np.stack([val_image_names, val_targets], axis=1), columns=["image", "target"]
+        np.stack([val_image_names, val_targets], axis=1), columns=["image", "label"]
     )
     val_targets_df.loc[
-        ~val_targets_df.target.isin(allowed_targets), "target"
+        ~val_targets_df.label.isin(allowed_targets), "label"
     ] = "new_individual"
 
     return val_targets_df
@@ -406,25 +418,53 @@ def create_and_search_index(
 
 
 def create_distances_df(
-    image_names: np.ndarray, labels: np.ndarray, D: np.ndarray, I: np.ndarray
-) -> pd.DataFrame:
-    distance_df = []
-    for i, image_name in enumerate(image_names):
-        label = labels[I[i]]
-        distances = D[i]
-        subset_preds = {"label": label, "distances": distances, "image": image_name}
-        distance_df.append(subset_preds)
+    image_names: np.ndarray, labels: np.ndarray, D: np.ndarray, I: np.ndarray) -> pd.DataFrame:
+    def _my_code(
+        image_names: np.ndarray, labels: np.ndarray, D: np.ndarray, I: np.ndarray
+    ) -> pd.DataFrame:
+        distance_df = []
+        for i, image_name in enumerate(image_names):
+            label = labels[I[i]]
+            distances = D[i]
+            subset_preds = {"label": label, "distances": distances, "image": image_name}
+            distance_df.append(subset_preds)
 
-    distance_df = pd.DataFrame(distance_df).reset_index(drop=True)
-    distance_df = (
-        distance_df.groupby(["image", "labels"])["distances"]
-        .max()
-        .reset_index(drop=True)
-    )
-    distance_df = distance_df.sort_values("distances", ascending=False).reset_index(
-        drop=True
-    )
-    return distance_df
+        distance_df = pd.DataFrame(distance_df).reset_index(drop=True)
+        logger.info(f"distance_df.head() = \n {distance_df.head()}")
+        distance_df = (
+            distance_df.groupby(["image", "label"])
+            .distnaces.max()
+            .reset_index(drop=True)
+        )
+        distance_df = distance_df.sort_values("distances", ascending=False).reset_index(
+            drop=True
+        )
+        return distance_df
+
+    def _ref_code(
+        image_names: np.ndarray, labels: np.ndarray, D: np.ndarray, I: np.ndarray
+    ) -> pd.DataFrame:
+        distances_df = []
+        for i, image_name in tqdm(enumerate(image_names)):
+            label = labels[I[i]]
+            distances = D[i]
+            subset_preds = pd.DataFrame(
+                np.stack([label, distances], axis=1), columns=["label", "distances"]
+            )
+            subset_preds["image"] = image_name
+            distances_df.append(subset_preds)
+
+        distances_df = pd.concat(distances_df).reset_index(drop=True)
+        distances_df = (
+            distances_df.groupby(["image", "label"]).distances.max().reset_index()
+        )
+        distances_df = distances_df.sort_values(
+            "distances", ascending=False
+        ).reset_index(drop=True)
+
+        return distances_df
+
+    return _ref_code(image_names, labels, D, I)
 
 
 def get_best_threshold(
@@ -435,7 +475,13 @@ def get_best_threshold(
     for thr in np.arange(0.1, 0.9, 0.1):
         all_preds = get_predictions(val_df, threshold=thr)
 
-        cv = map_per_set(val_targets_df["labels"], all_preds)
+        # cv = map_per_set(val_targets_df["label"], all_preds)
+        cv = 0
+        labels = val_targets_df["label"]
+        images = val_targets_df["image"]
+        for i, (label, image) in enumerate(zip(labels, images)):
+            preds = all_preds[image]
+            val_targets_df.loc[i, thr] = map_per_image(label, preds)
 
         logger.info(f"thr={thr}, cv={cv}")
         if cv > best_cv:
@@ -446,8 +492,9 @@ def get_best_threshold(
 
     # Adjustment: Since Public lb has nearly 10% 'new_individual' (Be Careful for private LB)
     val_targets_df.loc[:, "is_new_individual"] = (
-        val_targets_df["target"] == "new_individual"
+        val_targets_df["label"] == "new_individual"
     )
+    logger.info(f"val_target_df.head() = \n {val_targets_df.head()}")
     val_scores = val_targets_df.groupby("is_new_individual").mean().T
     val_scores.loc[:, "adjusted_cv"] = val_scores[True] * 0.1 + val_scores[False] * 0.9
     best_thr = val_scores["adjusted_cv"].idxmax()
@@ -701,6 +748,7 @@ class MyLitModel(pl.LightningModule):
         super().__init__()
         self._config = config
         self.batch_size = config.train_loader.batch_size
+        self.embedding_size = config.model.embedding_size
         self._criterion = eval(config.loss)()
         self._transform = get_transform(config)
         self._dtype = torch.float if config.trainer.precision == 32 else torch.half
@@ -894,9 +942,7 @@ def infer(
     val_img_name, val_embs, val_labels = get_embeddings(module, val_loader, encoder)
     test_img_name, test_embs, test_labels = get_embeddings(module, test_loader, encoder)
 
-    D, I = create_and_search_index(
-        module.hparams.embeddings_size, train_embs, val_embs, k
-    )
+    D, I = create_and_search_index(module.embedding_size, train_embs, val_embs, k)
 
     val_targets_df = create_val_targets_df(train_labels, val_img_name, val_labels)
     val_df = create_distances_df(val_img_name, train_labels, D, I)
@@ -905,9 +951,7 @@ def infer(
     train_embs = np.concatenate([train_embs, val_embs])
     train_labels = np.concatenate([train_labels, val_labels])
 
-    D, I = create_and_search_index(
-        module.hparams.embeddings_size, train_embs, test_embs, k
-    )
+    D, I = create_and_search_index(module.embedding_size, train_embs, test_embs, k)
     test_df = create_distances_df(test_img_name, train_labels, D, I)
     predictions = create_predictions_df(test_df, best_thr)
 
@@ -948,8 +992,9 @@ def update_config(config: DictConfig) -> DictConfig:
     if args.debug:
         logger.info(" ####### debug mode is called. ####### ")
         config["trainer"]["limit_train_batches"] = 0.005
-        config["trainer"]["limit_val_batches"] = 0.005
+        config["trainer"]["limit_val_batches"] = 0.02
         config["trainer"]["max_epochs"] = 1
+        config["debug"] = True
 
     return config
 
@@ -959,6 +1004,10 @@ def main(config: DictConfig) -> None:
     pprint.pprint(config)
 
     for fold in range(config.n_splits):
+        torch.autograd.set_detect_anomaly(True)
+        seed_everything(config.seed)
+        if config.debug and fold > 0:
+            break
         # prepare data
         le_encoder = LabelEncoder()
         df = preprocess_df(config, le_encoder)
@@ -986,21 +1035,19 @@ def main(config: DictConfig) -> None:
                     f"{config.model.name}-fold{config.n_splits}-{fold}*"
                 )
             )
-            state_dict = torch.load(checkpoint_path)["state_dict"]
-            model.load_state_dict(state_dict)
-            params = dict(**config.trainer)
-            params.update(
-                {
-                    "gpus": 1,
-                    "logger": None,
-                    "limit_train_batches": 0.0,
-                    "limit_val_batches": 0.0,
-                    "limit_test_batches": 1.0,
-                }
+            pprint.pprint(checkpoint_path)
+
+            infer(
+                checkpoint_path[0],
+                train_df,
+                val_df,
+                test_df,
+                config.img_size,
+                config.test_loader.batch_size,
+                config,
+                50,
             )
 
-            trainer = pl.Trainer(**params)
-            trainer.test(model, datamodule)
         torch.cuda.empty_cache()
 
 
