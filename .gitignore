@@ -133,3 +133,4 @@ output
 .devcontainer
 
 wandb_logs
+wandb

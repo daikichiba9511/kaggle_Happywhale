@@ -17,7 +17,7 @@ if [ $1 = "all" ]; then
 fi
 
 # for experiment
-if [ $1 = "val" ]; then
+if [ $1 = "exp" ]; then
         python $FILE_NAME \
                 --exp \
                 --train_fold 0

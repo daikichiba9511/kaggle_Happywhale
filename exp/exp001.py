@@ -1,3 +1,9 @@
+""" exp001
+
+use backfin data as train data
+
+
+"""
 import argparse
 import hashlib
 import math
@@ -6,7 +12,6 @@ import pprint
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import wandb
 import pdb
 from tqdm.auto import tqdm
 import faiss
@@ -38,14 +43,12 @@ from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader, Dataset
 from typing_extensions import Literal
 
-
 config: DictConfig = OmegaConf.create(
     dict(
-        exp_desc="exp000-batch512-emb1536",
         train=True,
         debug=False,
         train_fold=[0, 1, 2, 3, 4],
-        inference=False,
+        inference=True,
         device="cuda" if torch.cuda.is_available() else "cpu",
         seed=2022,
         img_size=224,
@@ -57,19 +60,14 @@ config: DictConfig = OmegaConf.create(
         warm_start_path=None,
         wandb_project="HappyWhale",
         model=dict(
-            # name="tf_efficientnet_b7_ns",
-            # name="efficientnet_b7",
-            # name="convnext_large_in22ft1k",
-            # name="convnext_small",
-            # name="convnext_large",
-            name="swin_base_patch4_window7_224",
+            name="tf_efficientnet_b4_ns",
             pretrained=True,
-            embedding_size=512 * 3,
-            arc_params=dict(s=30.0, m=0.50, ls_eps=0.0, easy_margin=False),
+            embedding_size=512,
+            arc_params=dict(s=20.0, m=0.50, ls_eps=0.0, easy_margin=False),
         ),
         trainer=dict(
             gpus=1,
-            accumulate_grad_batches=8,
+            accumulate_grad_batches=4,
             progress_bar_refresh_rate=1,
             fast_dev_run=False,
             num_sanity_val_steps=3,
@@ -85,15 +83,13 @@ config: DictConfig = OmegaConf.create(
             benchmark=False,
             weights_summary="top",
             reload_dataloaders_every_epoch=True,
-            auto_scale_batch_size="binsearch",
+            auto_scale_batch_size=True,
             auto_lr_find=True,
-            max_epochs=30,
+            max_epochs=50,
             stochastic_weight_avg=False,
-            # amp_backend="native",
-            # amp_level="02",
         ),
-        batch_size=64,
-        train_loader=dict(shuffle=True, num_workers=4, pin_memory=True, drop_last=True),
+        batch_size=128,
+        train_loader=dict(shuffle=True, num_workers=2, pin_memory=True, drop_last=True),
         val_loader=dict(
             shuffle=False,
             num_workers=4,
@@ -112,13 +108,13 @@ config: DictConfig = OmegaConf.create(
         ),
         scheduler=dict(
             name="optim.lr_scheduler.CosineAnnealingLR",
-            params=dict(T_max=30),
+            params=dict(T_max=50),
         ),
         loss="nn.CrossEntropyLoss",
         callbacks=dict(
             monitor_metric="val_loss",
             mode="min",
-            patience=5,
+            patience=10,
         ),
     )
 )
@@ -185,12 +181,13 @@ def plot_dist(
 def get_df(config: DictConfig, mode: str = "train") -> pd.DataFrame:
     assert mode in {"train", "test"}
     if mode == "train":
-        train_img_dir = Path(config.data_path) / "train_images"
+        train_img_dir = Path(config.data_path + "-backfin") / "train_images"
 
         def _get_train_file_path(idx: str) -> Path:
             return train_img_dir / idx
 
-        train_df = pd.read_csv(Path(config.data_path) / "train.csv")
+        # use backfin data
+        train_df = pd.read_csv(Path(config.data_path + "-backfin") / "train.csv")
         train_df.loc[:, "file_path"] = train_df["image"].map(_get_train_file_path)
         train_df["species"].replace(
             {
@@ -247,7 +244,8 @@ def preprocess_df(
     save: bool = True,
 ) -> pd.DataFrame:
     train_df_path = (
-        Path(config.data_path) / f"train-df-fold{config.n_splits}-seed{config.seed}.csv"
+        Path(config.data_path)
+        / f"backfin-train-df-fold{config.n_splits}-seed{config.seed}.csv"
     )
     if not recache and train_df_path.exists():
         logger.info(f"cached file is loaded : {train_df_path}")
@@ -264,9 +262,7 @@ def get_transform(config: DictConfig) -> dict:
     transform = {
         "train": A.Compose(
             [
-                A.Resize(
-                    config.img_size, config.img_size, interpolation=cv2.INTER_CUBIC
-                ),
+                A.Resize(config.img_size, config.img_size),
                 A.HorizontalFlip(p=0.5),
                 A.Normalize(
                     mean=[0.485, 0.456, 0.406],
@@ -280,9 +276,7 @@ def get_transform(config: DictConfig) -> dict:
         ),
         "val": A.Compose(
             [
-                A.Resize(
-                    config.img_size, config.img_size, interpolation=cv2.INTER_CUBIC
-                ),
+                A.Resize(config.img_size, config.img_size),
                 A.Normalize(
                     mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225],
@@ -295,11 +289,7 @@ def get_transform(config: DictConfig) -> dict:
         ),
         "test": A.Compose(
             [
-                A.Resize(
-                    config["img_size"],
-                    config["img_size"],
-                    interpolation=cv2.INTER_CUBIC,
-                ),
+                A.Resize(config["img_size"], config["img_size"]),
                 A.Normalize(
                     mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225],
@@ -609,9 +599,8 @@ class MyLitDataModule(pl.LightningDataModule):
         self._val_df = val_df
         self._test_df = test_df
         self._config = config
-        self.save_hyperparameters()
 
-        logger.info(f"batch_size = {self.hparams.batch_size}")
+        self.save_hyperparameters()
 
     def __create_dataset(self, mode: str) -> Dataset:
         if mode == "train":
@@ -666,15 +655,11 @@ class GeM(nn.Module):
         self._eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.ndim == 3 or x.ndim == 4, ValueError(
-            f"x.ndim != 3 | x.ndm != 4 : x.ndim {x.ndim} & x.shape {x.shape}"
-        )
         return self.gem(x, p=self._p, eps=self._eps)
 
     def gem(
         self, x: torch.Tensor, p: nn.parameter.Parameter, eps: float = 1e-6
     ) -> torch.Tensor:
-        # pdb.set_trace()
         return F.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(
             1.0 / p
         )
@@ -763,16 +748,14 @@ class HappyWhaleModel(nn.Module):
     ) -> None:
         super().__init__()
         self.backbone = timm.create_model(model_name, pretrained=pretrained)
-        in_features = self.backbone.get_classifier().in_features
-        # self.backbone.classifier = nn.Identity()
-        # self.backbone.global_pool = nn.Identity()
+        in_features = self.backbone.classifier.in_features
+        self.backbone.classifier = nn.Identity()
+        self.backbone.global_pool = nn.Identity()
+        self.pooling = GeM()
         self.drop = nn.Dropout(p=0.2, inplace=False)
         self.fc = nn.Linear(in_features, config.model.embedding_size)
-        # self.fc = nn.LazyLinear(out_features=config.model.embedding_size)
-        self.backbone.reset_classifier(num_classes=0, global_pool="avg")
-        # self.pooling = GeM()
         self.arc = ArcMarginProduct(
-            config.model.embedding_size,
+            512,
             config.num_classes,
             config=config,
             s=config.model.arc_params.s,
@@ -785,8 +768,8 @@ class HappyWhaleModel(nn.Module):
         self, images: torch.Tensor, labels: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         features = self.backbone(images)
-        # features = self.pooling(features).flatten(1)
-        pooled_drop = self.drop(features)
+        pooled_features = self.pooling(features).flatten(1)
+        pooled_drop = self.drop(pooled_features)
         emb = self.fc(pooled_drop)
         output = self.arc(emb, labels)
         return output, emb
@@ -813,7 +796,6 @@ class MyLitModel(pl.LightningModule):
         # settings of wandb logger
         self.monitor_metric = config.callbacks.monitor_metric
         self.monitor_mode = config.callbacks.mode
-        self.logger_cnt = 0
 
         # self._le = self.__load_le()
         self._test_preds_df_path = config.data_path + "/test/test.csv"
@@ -836,11 +818,9 @@ class MyLitModel(pl.LightningModule):
         return self.model(images, labels)
 
     def training_step(self, batch: dict, batch_idx: int) -> dict:
-        if self.global_step == 0 and self.logger_cnt == 0:
-            self.logger.experiment.define_metric(
-                self.monitor_metric, summary=self.monitor_mode
-            )
-            self.logger_cnt += 1
+        if self.global_step == 0:
+            self.logger.experiment.define_metric(self.monitor_metric, summary=self.monitor_mode)
+
 
         loss, pred, labels, img_path, idx, emb = self.__share_step(batch, "train")
         return {
@@ -898,11 +878,11 @@ class MyLitModel(pl.LightningModule):
 
         preds = torch.cat(preds)
         labels = torch.cat(labels)
-        metric = F.cross_entropy(preds.float(), labels.long())
+        loss = F.cross_entropy(preds.float(), labels.long())
         if mode == "train":
-            self.log(f"fold{config.fold}_train_loss", metric)
+            self.log(f"fold{config.fold}_train_loss", loss)
         elif mode == "val":
-            self.log(self._config.callbacks.monitor_metric, metric)
+            self.log(self._config.callbacks.monitor_metric, loss)
 
     def test_step_end(self, outputs):
         # TODO: 予測を本来のラベルにもどす
@@ -928,13 +908,7 @@ class MyLitModel(pl.LightningModule):
         return [optimizer], [scheduler]
 
 
-def train(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    fold: int,
-    config: DictConfig,
-) -> None:
+def train(model, datamodule, fold: int, config: DictConfig) -> None:
 
     # monitor metric
     config["callbacks"]["monitor_metric"] = (
@@ -951,7 +925,7 @@ def train(
     )
     lr_monitor = callbacks.LearningRateMonitor()
     loss_checkpoint = callbacks.ModelCheckpoint(
-        dirpath=f"./output/{config.model.name}/{config.exp_desc}",
+        dirpath=f"./output/{config.model.name}",
         filename=f"{config.model.name}"
         + f"-fold{config.n_splits}-{fold}"
         + "-{epoch}-{step}",
@@ -980,24 +954,12 @@ def train(
         logger.info(checkpoint_path)
         config.trainer.resume_from_checkpoint = checkpoint_path
 
-    model = MyLitModel(
-        config.batch_size,
-        config.optimizer.default_lr,
-        config.model.embedding_size,
-        config,
-    )
-
     trainer = pl.Trainer(
         logger=pl_logger,
         callbacks=[lr_monitor, loss_checkpoint, earystopping],
         **config.trainer,
     )
-
-    datamodule = MyLitDataModule(train_df, val_df, test_df, config.batch_size, config)
     trainer.tune(model, datamodule=datamodule)
-
-    logger.info(f"overwrited batch_size = {model.hparams.batch_size}")
-
     trainer.fit(model, datamodule=datamodule)
 
 
@@ -1114,14 +1076,24 @@ def main(config: DictConfig) -> None:
             save_name=config.output_path + f"/fold{fold}-dist.png",
         )
 
+        datamodule = MyLitDataModule(
+            train_df, val_df, test_df, config.batch_size, config
+        )
+        model = MyLitModel(
+            config.batch_size,
+            config.optimizer.default_lr,
+            config.model.embedding_size,
+            config,
+        )
+
         if config.train and fold in config.train_fold:
             logger.info("#" * 8 + f"  Fold: {fold}  " + "#" * 8)
-            train(train_df, val_df, test_df, fold, config)
+            train(model, datamodule, fold, config)
 
         if config.inference:
             # inference関数を実装する
             checkpoint_path = list(
-                (Path(config.output_path) / config.model.name / config.exp_desc).glob(
+                (Path(config.output_path) / config.model.name).glob(
                     f"{config.model.name}-fold{config.n_splits}-{fold}*"
                 )
             )
