@@ -41,8 +41,8 @@ from typing_extensions import Literal
 
 config: DictConfig = OmegaConf.create(
     dict(
-        exp_desc="exp000-batch512-emb1536-convnext-large-makesub",
-        train=False,
+        exp_desc="exp000-batch512-emb1536-efficientnet_b7-large-backfindata",
+        train=True,
         debug=False,
         train_fold=[0, 1, 2, 3, 4],
         inference=True,
@@ -58,17 +58,17 @@ config: DictConfig = OmegaConf.create(
         wandb_project="HappyWhale",
         model=dict(
             # name="tf_efficientnet_b7_ns",
-            # name="efficientnet_b7",
+            name="efficientnet_b7",
             # name="convnext_small",
             # name="convnext_small_in22ft1k",
             # name="convnext_large",
-            name="convnext_large_in22ft1k",
+            # name="convnext_large_in22ft1k",
             # name="swin_large_patch4_window7_224",
             # name="swin_base_patch4_window12_384_in22k",
             # name="beit_base_patch16_224_in22k",
             pretrained=True,
-            embedding_size=512 * 3,
-            arc_params=dict(s=30.0, m=0.50, ls_eps=0.0, easy_margin=False),
+            embedding_size=512,
+            arc_params=dict(s=10.0, m=0.50, ls_eps=0.0, easy_margin=False),
         ),
         trainer=dict(
             gpus=1,
@@ -110,9 +110,7 @@ config: DictConfig = OmegaConf.create(
             drop_last=False,
         ),
         # optimizer=dict(name="optim.AdamW", params=dict(lr=5e-4)),
-        optimizer=dict(
-            name="optim.AdamW", default_lr=3e-4, params=dict(weight_decay=1e-6)
-        ),
+        optimizer=dict(name="optim.AdamW", default_lr=3e-4, params=dict(weight_decay=1e-6)),
         scheduler=dict(
             name="optim.lr_scheduler.CosineAnnealingLR",
             params=dict(T_max=30),
@@ -174,14 +172,10 @@ def map_per_set(labels: List[str], predictions: List[List[str]]) -> np.floating:
     -------
     score : double
     """
-    return np.mean(
-        [map_per_image(label, pred) for label, pred in zip(labels, predictions)]
-    )
+    return np.mean([map_per_image(label, pred) for label, pred in zip(labels, predictions)])
 
 
-def plot_dist(
-    label: np.ndarray, save_name: str, figsize: Tuple[int, int] = (400, 200)
-) -> None:
+def plot_dist(label: np.ndarray, save_name: str, figsize: Tuple[int, int] = (400, 200)) -> None:
     plt.figure(figsize=figsize)
     plt.hist(label, label="label")
     plt.savefig(save_name)
@@ -195,6 +189,7 @@ def get_df(config: DictConfig, mode: str = "train") -> pd.DataFrame:
         def _get_train_file_path(idx: str) -> Path:
             return train_img_dir / idx
 
+        logger.info(f"train_img_dir = {train_img_dir}")
         train_df = pd.read_csv(Path(config.data_path) / "train.csv")
         train_df.loc[:, "file_path"] = train_df["image"].map(_get_train_file_path)
         train_df["species"].replace(
@@ -206,6 +201,7 @@ def get_df(config: DictConfig, mode: str = "train") -> pd.DataFrame:
             },
             inplace=True,
         )
+        logger.info(f"train_df.individual_id.nunique() = {train_df.individual_id.nunique()}")
         return train_df
 
     elif mode == "test":
@@ -223,21 +219,21 @@ def get_df(config: DictConfig, mode: str = "train") -> pd.DataFrame:
         raise ValueError(f"mode {mode} is not valid")
 
 
-def encode_ids(
-    df: pd.DataFrame, config: DictConfig, le_encoder: LabelEncoder, save: bool = False
-) -> pd.DataFrame:
+def encode_ids(df: pd.DataFrame, config: DictConfig, le_encoder: LabelEncoder, save: bool = False) -> pd.DataFrame:
     df.loc[:, "individual_id"] = le_encoder.fit_transform(df["individual_id"])
     if save:
-        pickle_data_path = Path(config.output_path) / "le.pkl"
-        with pickle_data_path.open("wb") as f:
-            joblib.dump(le_encoder, f)
+        pickle_data_path = Path(config.output_path) / "backfin-le"
+        logger.info(f"saved label encocder: {pickle_data_path}")
+        np.save(pickle_data_path, le_encoder.classes_)
+        logger.info(f"claases: {len(le_encoder.classes_)}")
+
+        # with pickle_data_path.open("wb") as f:
+        # joblib.dump(le_encoder, f)
     return df
 
 
 def create_folds(df: pd.DataFrame, config: DictConfig) -> pd.DataFrame:
-    skf = StratifiedKFold(
-        n_splits=config.n_splits, shuffle=True, random_state=config.seed
-    )
+    skf = StratifiedKFold(n_splits=config.n_splits, shuffle=True, random_state=config.seed)
     for fold, (_, val_idx) in enumerate(skf.split(X=df, y=df["individual_id"])):
         df.loc[val_idx, "fold"] = fold
     df.loc[:, "fold"] = df["fold"].astype(int)
@@ -248,17 +244,8 @@ def create_folds(df: pd.DataFrame, config: DictConfig) -> pd.DataFrame:
 def preprocess_df(
     config: DictConfig,
     le_encoder: LabelEncoder,
-    recache: bool = False,
     save: bool = True,
 ) -> pd.DataFrame:
-    train_df_path = (
-        Path(config.data_path) / f"train-df-fold{config.n_splits}-seed{config.seed}.csv"
-    )
-    if not recache and train_df_path.exists():
-        logger.info(f"cached file is loaded : {train_df_path}")
-        df = pd.read_csv(train_df_path)
-        return df
-
     df = get_df(config)
     df = encode_ids(df, config, le_encoder, save)
     df = create_folds(df, config)
@@ -269,9 +256,7 @@ def get_transform(config: DictConfig) -> dict:
     transform = {
         "train": A.Compose(
             [
-                A.Resize(
-                    config.img_size, config.img_size, interpolation=cv2.INTER_CUBIC
-                ),
+                A.Resize(config.img_size, config.img_size, interpolation=cv2.INTER_CUBIC),
                 A.HorizontalFlip(p=0.5),
                 A.Normalize(
                     mean=[0.485, 0.456, 0.406],
@@ -285,9 +270,7 @@ def get_transform(config: DictConfig) -> dict:
         ),
         "val": A.Compose(
             [
-                A.Resize(
-                    config.img_size, config.img_size, interpolation=cv2.INTER_CUBIC
-                ),
+                A.Resize(config.img_size, config.img_size, interpolation=cv2.INTER_CUBIC),
                 A.Normalize(
                     mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225],
@@ -322,9 +305,7 @@ def get_transform(config: DictConfig) -> dict:
 # ==================
 # infer funcs
 # ==================
-def get_predictions(
-    test_df: pd.DataFrame, threshold: float = 0.2
-) -> Dict[str, List[str]]:
+def get_predictions(test_df: pd.DataFrame, threshold: float = 0.2) -> Dict[str, List[str]]:
     predictions: Dict[str, List[str]] = {}
     images = test_df["image"]
     targets = test_df["label"]
@@ -386,8 +367,11 @@ def load_dataloaders(
 
 
 def load_encoder(le_path: str) -> LabelEncoder:
-    with open(le_path, "rb") as f:
-        le = joblib.load(f)
+    logger.info(f"label encoder path = {le_path}")
+    # with open(le_path, "rb") as f:
+    # le = joblib.load(f)
+    le = LabelEncoder()
+    le.classes_ = np.load(le_path, allow_pickle=True)
     return le
 
 
@@ -432,12 +416,8 @@ def create_val_targets_df(
 ) -> pd.DataFrame:
 
     allowed_targets = np.unique(train_targets)
-    val_targets_df = pd.DataFrame(
-        np.stack([val_image_names, val_targets], axis=1), columns=["image", "label"]
-    )
-    val_targets_df.loc[
-        ~val_targets_df.label.isin(allowed_targets), "label"
-    ] = "new_individual"
+    val_targets_df = pd.DataFrame(np.stack([val_image_names, val_targets], axis=1), columns=["image", "label"])
+    val_targets_df.loc[~val_targets_df.label.isin(allowed_targets), "label"] = "new_individual"
 
     return val_targets_df
 
@@ -454,12 +434,8 @@ def create_and_search_index(
     return D, I
 
 
-def create_distances_df(
-    image_names: np.ndarray, labels: np.ndarray, D: np.ndarray, I: np.ndarray
-) -> pd.DataFrame:
-    def _my_code(
-        image_names: np.ndarray, labels: np.ndarray, D: np.ndarray, I: np.ndarray
-    ) -> pd.DataFrame:
+def create_distances_df(image_names: np.ndarray, labels: np.ndarray, D: np.ndarray, I: np.ndarray) -> pd.DataFrame:
+    def _my_code(image_names: np.ndarray, labels: np.ndarray, D: np.ndarray, I: np.ndarray) -> pd.DataFrame:
         distance_df = []
         for i, image_name in enumerate(image_names):
             label = labels[I[i]]
@@ -469,45 +445,29 @@ def create_distances_df(
 
         distance_df = pd.DataFrame(distance_df).reset_index(drop=True)
         logger.info(f"distance_df.head() = \n {distance_df.head()}")
-        distance_df = (
-            distance_df.groupby(["image", "label"])
-            .distnaces.max()
-            .reset_index(drop=True)
-        )
-        distance_df = distance_df.sort_values("distances", ascending=False).reset_index(
-            drop=True
-        )
+        distance_df = distance_df.groupby(["image", "label"]).distnaces.max().reset_index(drop=True)
+        distance_df = distance_df.sort_values("distances", ascending=False).reset_index(drop=True)
         return distance_df
 
-    def _ref_code(
-        image_names: np.ndarray, labels: np.ndarray, D: np.ndarray, I: np.ndarray
-    ) -> pd.DataFrame:
+    def _ref_code(image_names: np.ndarray, labels: np.ndarray, D: np.ndarray, I: np.ndarray) -> pd.DataFrame:
         distances_df = []
         for i, image_name in tqdm(enumerate(image_names)):
             label = labels[I[i]]
             distances = D[i]
-            subset_preds = pd.DataFrame(
-                np.stack([label, distances], axis=1), columns=["label", "distances"]
-            )
+            subset_preds = pd.DataFrame(np.stack([label, distances], axis=1), columns=["label", "distances"])
             subset_preds["image"] = image_name
             distances_df.append(subset_preds)
 
         distances_df = pd.concat(distances_df).reset_index(drop=True)
-        distances_df = (
-            distances_df.groupby(["image", "label"]).distances.max().reset_index()
-        )
-        distances_df = distances_df.sort_values(
-            "distances", ascending=False
-        ).reset_index(drop=True)
+        distances_df = distances_df.groupby(["image", "label"]).distances.max().reset_index()
+        distances_df = distances_df.sort_values("distances", ascending=False).reset_index(drop=True)
 
         return distances_df
 
     return _ref_code(image_names, labels, D, I)
 
 
-def get_best_threshold(
-    val_targets_df: pd.DataFrame, val_df: pd.DataFrame
-) -> Tuple[float, float]:
+def get_best_threshold(val_targets_df: pd.DataFrame, val_df: pd.DataFrame) -> Tuple[float, float]:
     best_thr = 0
     best_cv = 0
     for thr in np.arange(0.1, 0.9 + 1e-6, 0.1):
@@ -529,14 +489,13 @@ def get_best_threshold(
     logger.info(f"######### best_thr={best_thr:.2f}, best_cv={best_cv} ########## ")
 
     # Adjustment: Since Public lb has nearly 10% 'new_individual' (Be Careful for private LB)
-    val_targets_df.loc[:, "is_new_individual"] = (
-        val_targets_df["label"] == "new_individual"
-    )
+    val_targets_df.loc[:, "is_new_individual"] = val_targets_df["label"] == "new_individual"
     logger.info(f"val_target_df.head() = \n {val_targets_df.head()}")
     val_scores = val_targets_df.groupby("is_new_individual").mean().T
     val_scores.loc[:, "adjusted_cv"] = val_scores[True] * 0.1 + val_scores[False] * 0.9
+    logger.info(f"val_scores.head() = {val_scores.head()}")
     best_thr = val_scores["adjusted_cv"].idxmax()
-    logger.info(f"best_thr_adjusted={best_thr}")
+    logger.info(f"best_thr_adjusted = {best_thr}")
     return best_thr, best_cv
 
 
@@ -544,9 +503,7 @@ def create_predictions_df(test_df: pd.DataFrame, best_thr: float) -> pd.DataFram
     predictions = get_predictions(test_df, best_thr)
     predictions = pd.Series(predictions).reset_index()
     predictions.columns = ["image", "predictions"]
-    predictions.loc[:, "predictions"] = predictions["predictions"].map(
-        lambda x: " ".join(x)
-    )
+    predictions.loc[:, "predictions"] = predictions["predictions"].map(lambda x: " ".join(x))
     return predictions
 
 
@@ -554,18 +511,16 @@ def create_predictions_df(test_df: pd.DataFrame, best_thr: float) -> pd.DataFram
 # Data
 # =============================
 class HappyWhaleDataset(Dataset):
-    def __init__(
-        self, df: pd.DataFrame, mode: str, transform: Optional[dict] = None
-    ) -> None:
+    def __init__(self, df: pd.DataFrame, mode: str, transform: Optional[dict] = None) -> None:
         assert mode in {"train", "val", "test"}
         super().__init__()
         self._df = df
-        self._images = df["image"].values
-        self._file_names = df["file_path"].values
+        self._images = df["image"].to_numpy()
+        self._file_names = df["file_path"].to_numpy()
         if mode == "test":
-            self._labels = df["dummy_labels"].values
+            self._labels = df["dummy_labels"].to_numpy()
         else:
-            self._labels = df["individual_id"].values
+            self._labels = df["individual_id"].to_numpy()
 
         self._mode = mode
         self._transform = transform
@@ -617,40 +572,29 @@ class MyLitDataModule(pl.LightningDataModule):
         self.save_hyperparameters()
 
         logger.info(f"batch_size = {self.hparams.batch_size}")
+        logger.info(f"train_df.individual_id.nunique() = {self._train_df.individual_id.nunique()}")
 
     def __create_dataset(self, mode: str) -> Dataset:
         if mode == "train":
-            return HappyWhaleDataset(
-                df=self._train_df, transform=get_transform(self._config), mode="train"
-            )
+            return HappyWhaleDataset(df=self._train_df, transform=get_transform(self._config), mode="train")
         elif mode == "val":
-            return HappyWhaleDataset(
-                df=self._val_df, transform=get_transform(self._config), mode="val"
-            )
+            return HappyWhaleDataset(df=self._val_df, transform=get_transform(self._config), mode="val")
         elif mode == "test":
-            return HappyWhaleDataset(
-                df=self._test_df, transform=get_transform(self._config), mode="test"
-            )
+            return HappyWhaleDataset(df=self._test_df, transform=get_transform(self._config), mode="test")
         else:
             raise ValueError
 
     def train_dataloader(self) -> DataLoader:
         dataset = self.__create_dataset(mode="train")
-        return DataLoader(
-            dataset, batch_size=self.hparams.batch_size, **self._config.train_loader
-        )
+        return DataLoader(dataset, batch_size=self.hparams.batch_size, **self._config.train_loader)
 
     def val_dataloader(self) -> DataLoader:
         dataset = self.__create_dataset(mode="val")
-        return DataLoader(
-            dataset, batch_size=self.hparams.batch_size, **self._config.val_loader
-        )
+        return DataLoader(dataset, batch_size=self.hparams.batch_size, **self._config.val_loader)
 
     def test_dataloader(self) -> DataLoader:
         dataset = self.__create_dataset(mode="test")
-        return DataLoader(
-            dataset, batch_size=self.hparams.batch_size, **self._config.test_loader
-        )
+        return DataLoader(dataset, batch_size=self.hparams.batch_size, **self._config.test_loader)
 
 
 # =============================
@@ -676,21 +620,12 @@ class GeM(nn.Module):
         )
         return self.gem(x, p=self._p, eps=self._eps)
 
-    def gem(
-        self, x: torch.Tensor, p: nn.parameter.Parameter, eps: float = 1e-6
-    ) -> torch.Tensor:
+    def gem(self, x: torch.Tensor, p: nn.parameter.Parameter, eps: float = 1e-6) -> torch.Tensor:
         # pdb.set_trace()
-        return F.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(
-            1.0 / p
-        )
+        return F.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(1.0 / p)
 
     def __repr__(self) -> str:
-        return (
-            self.__class__.__name__
-            + "("
-            + f"p={self._p.data.tolist()[0]:.4f}"
-            + f",eps={self._eps})"
-        )
+        return self.__class__.__name__ + "(" + f"p={self._p.data.tolist()[0]:.4f}" + f",eps={self._eps})"
 
 
 class ArcMarginProduct(nn.Module):
@@ -732,11 +667,18 @@ class ArcMarginProduct(nn.Module):
         self.th = math.cos(math.pi - m)
         self.mm = math.sin(math.pi - m) * m
 
+        # self.norm = nn.BatchNorm1d(in_features)
+
         self._device = torch.device(config.device)
         self._dtype = torch.float if config.trainer.precision == 32 else torch.half
 
     def forward(self, x: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
         # cos(theta) & phi(theta)
+        # you should do batch norm operation before multiply by weights
+        # Ref
+        # * https://www.kaggle.com/c/recursion-cellular-image-classification/discussion/109987
+        # * https://www.kaggle.com/competitions/happy-whale-and-dolphin/discussion/315129
+        # x = self.norm(x)
         cos = F.linear(F.normalize(x), F.normalize(self.weight))
         sin = torch.sqrt(1.0 - torch.pow(cos, 2))
         phi = cos * self.cos_m - sin * self.sin_m
@@ -786,13 +728,16 @@ class HappyWhaleModel(nn.Module):
             ls_eps=config.model.arc_params.ls_eps,
         )
 
-    def forward(
-        self, images: torch.Tensor, labels: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.norm1 = nn.BatchNorm1d(in_features)
+        self.norm2 = nn.BatchNorm1d(config.model.embedding_size)
+
+    def forward(self, images: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         features = self.backbone(images)
         # features = self.pooling(features).flatten(1)
-        pooled_drop = self.drop(features)
-        emb = self.fc(pooled_drop)
+        features = self.norm1(features)
+        features = self.drop(features)
+        emb = self.fc(features)
+        emb = self.norm2(emb)
         output = self.arc(emb, labels)
         return output, emb
 
@@ -831,21 +776,12 @@ class MyLitModel(pl.LightningModule):
             pretrained=self._config.model.pretrained,
         )
 
-    def __load_le(self) -> LabelEncoder:
-        with open(self._config.output_path + "/le.pkl", "rb") as f:
-            le = joblib.load(f)
-        return le
-
-    def forward(
-        self, images: torch.Tensor, labels: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, images: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.model(images, labels)
 
     def training_step(self, batch: dict, batch_idx: int) -> dict:
         if self.global_step == 0 and self.logger_cnt == 0:
-            self.logger.experiment.define_metric(
-                self.monitor_metric, summary=self.monitor_mode
-            )
+            self.logger.experiment.define_metric(self.monitor_metric, summary=self.monitor_mode)
             self.logger_cnt += 1
 
         loss, pred, labels, img_path, idx, emb = self.__share_step(batch, "train")
@@ -869,9 +805,7 @@ class MyLitModel(pl.LightningModule):
         }
 
     def __share_step(self, batch: dict, mode: str):
-        images, labels = batch["image"].to(dtype=self._dtype), batch["label"].to(
-            dtype=torch.long
-        )
+        images, labels = batch["image"].to(dtype=self._dtype), batch["label"].to(dtype=torch.long)
         img_path, idx = batch["image_path"], batch["id"]
         if mode == "train":
             outputs, emb = self.forward(images, labels)
@@ -944,9 +878,7 @@ def train(
 ) -> None:
 
     # monitor metric
-    config["callbacks"]["monitor_metric"] = (
-        f"fold{fold}_" + config["callbacks"]["monitor_metric"]
-    )
+    config["callbacks"]["monitor_metric"] = f"fold{fold}_" + config["callbacks"]["monitor_metric"]
     config["fold"] = fold
 
     # instanciate callbacks
@@ -958,10 +890,8 @@ def train(
     )
     lr_monitor = callbacks.LearningRateMonitor()
     loss_checkpoint = callbacks.ModelCheckpoint(
-        dirpath=f"./output/{config.model.name}/{config.exp_desc}",
-        filename=f"{config.model.name}"
-        + f"-fold{config.n_splits}-{fold}"
-        + "-{epoch}-{step}",
+        dirpath=f"./output/checkpoints/{config.model.name}/{config.exp_desc}",
+        filename=f"{config.model.name}" + f"-fold{config.n_splits}-{fold}" + "-{epoch}-{step}",
         monitor=config.callbacks.monitor_metric,
         save_top_k=1,
         mode=config.callbacks.mode,
@@ -1002,23 +932,22 @@ def train(
     )
 
     datamodule = MyLitDataModule(train_df, val_df, test_df, config.batch_size, config)
-    trainer.tune(model, datamodule=datamodule)
 
-    logger.info(f"overwrited batch_size = {model.hparams.batch_size}")
+    if not config.debug:
+        # trainer.tune(model, datamodule=datamodule)
+        logger.info(f"overwrited batch_size = {model.hparams.batch_size}")
 
     trainer.fit(model, datamodule=datamodule)
 
     # remove fold{fold}_ prefix
-    config["callbacks"]["monitor_metric"] = "_".join(
-        config["callbacks"]["monitor_metric"].split("_")[1:]
-    )
+    config["callbacks"]["monitor_metric"] = "_".join(config["callbacks"]["monitor_metric"].split("_")[1:])
 
 
 def save_cv(cv: float, fold: int, cv_csv_path: Path):
     import json
 
-    if not cv_csv_path.exists():
-        logger.info(f"cv_csv does not exist so make file {cv_csv_path}")
+    if not cv_csv_path.exists() or fold == 0:
+        logger.info(f"make cv_csv :{cv_csv_path}")
         cv_dict = dict()
     else:
         try:
@@ -1047,33 +976,28 @@ def infer(
 ):
     module = load_module(checkpoint_path, torch.device("cuda"), config)
 
-    train_loader, val_loader, test_loader = load_dataloaders(
-        train_df, val_df, test_df, config
-    )
+    logger.info(f"train_df.individual_id.nunique() = {train_df.individual_id.nunique()}")
+    logger.info(f"val_df.individual_id.nunique() = {val_df.individual_id.nunique()}")
+    train_loader, val_loader, test_loader = load_dataloaders(train_df, val_df, test_df, config)
 
-    encoder = load_encoder(config.output_path + "/le.pkl")
+    encoder = load_encoder(config.output_path + "/backfin-le.npy")
+    logger.info(f"infer classes: {len(encoder.classes_)}")
 
-    train_img_names, train_embs, train_labels = get_embeddings(
-        module,
-        train_loader,
-        encoder,
-        config,
-    )
-    val_img_name, val_embs, val_labels = get_embeddings(
-        module, val_loader, encoder, config
-    )
-    test_img_name, test_embs, test_labels = get_embeddings(
-        module, test_loader, encoder, config
-    )
+    train_img_names, train_embs, train_labels = get_embeddings(module, train_loader, encoder, config)
+    val_img_name, val_embs, val_labels = get_embeddings(module, val_loader, encoder, config)
+    test_img_name, test_embs, test_labels = get_embeddings(module, test_loader, encoder, config)
 
     D, I = create_and_search_index(module.embedding_size, train_embs, val_embs, k)
-    logger.info(f" Created index with train_embs: max(I): {max(I)}")
+    logger.info(" Created index with train_embs")
 
     val_targets_df = create_val_targets_df(train_labels, val_img_name, val_labels)
     logger.info(f"val_targets_df.head() = \n {val_targets_df.head()}")
 
     val_df = create_distances_df(val_img_name, train_labels, D, I)
     best_thr, best_cv = get_best_threshold(val_targets_df, val_df)
+    val_predictions = create_predictions_df(val_df, best_thr)
+    val_df_path = Path(config.output_path) / str(Path(__file__).stem) / f"fold{fold}-val-df.csv"
+    val_predictions.to_csv(val_df_path, index=False)
     save_cv(
         best_cv,
         fold,
@@ -1084,18 +1008,27 @@ def infer(
     train_labels = np.concatenate([train_labels, val_labels])
 
     D, I = create_and_search_index(module.embedding_size, train_embs, test_embs, k)
-    logger.info(f"max(I) of test_embs : {max(I)}")
     test_df = create_distances_df(test_img_name, train_labels, D, I)
     predictions = create_predictions_df(test_df, best_thr)
 
     logger.info(f"prediciotns_df \n{predictions.head()}")
 
-    # make submission
-    submission_csv_path = (
-        Path(config.output_path)
-        / str(Path(__file__).stem)
-        / f"fold{fold}-submission.csv"
+    public_predicitons_path = Path("./input") / "0-720-eff-b5-640-rotate" / "submission.csv"
+    public_predictions = pd.read_csv(public_predicitons_path)
+    ids_without_backfin_path = Path("./input") / "ids-without-backfin" / "ids_without_backfin.npy"
+    ids_without_backfin = np.load(ids_without_backfin_path, allow_pickle=True)
+    ids2 = public_predictions["image"][~public_predictions["image"].isin(predictions["image"])]
+    predictions = pd.concat(
+        [
+            predictions[~(predictions["image"].isin(ids_without_backfin))],
+            public_predictions[public_predictions["image"].isin(ids_without_backfin)],
+            public_predictions[public_predictions["image"].isin(ids2)],
+        ]
     )
+    predictions.drop_duplicates()
+
+    # make submission
+    submission_csv_path = Path(config.output_path) / str(Path(__file__).stem) / f"fold{fold}-submission.csv"
     submission_csv_path.parent.mkdir(parents=True, exist_ok=True)
     predictions.to_csv(submission_csv_path, index=False)
     logger.info(f"sub file path = {submission_csv_path}")
@@ -1137,7 +1070,7 @@ def update_config(config: DictConfig) -> DictConfig:
 
 def main(config: DictConfig) -> None:
     config = update_config(config)
-    pprint.pprint(config)
+    pprint.pprint(dict(config))
 
     for fold in range(config.n_splits):
         torch.autograd.set_detect_anomaly(True)
@@ -1146,16 +1079,13 @@ def main(config: DictConfig) -> None:
             break
         # prepare data
         le_encoder = LabelEncoder()
-        df = preprocess_df(config, le_encoder)
+        df = preprocess_df(config, le_encoder, save=True)
 
         train_df = df[df["fold"] != fold]
         val_df = df[df["fold"] == fold]
         test_df = get_df(config, mode="test")
 
-        plot_dist(
-            label=val_df["individual_id"].values,
-            save_name=config.output_path + f"/fold{fold}-dist.png",
-        )
+        plot_dist(label=val_df["individual_id"].values, save_name=config.output_path + f"/fold{fold}-dist.png")
 
         if config.train and fold in config.train_fold:
             logger.info("#" * 8 + f"  Fold: {fold}  " + "#" * 8)
@@ -1164,7 +1094,7 @@ def main(config: DictConfig) -> None:
         if config.inference:
             # inference関数を実装する
             checkpoint_path = list(
-                (Path(config.output_path) / config.model.name / config.exp_desc).glob(
+                (Path(config.output_path) / "checkpoiints" / config.model.name / config.exp_desc).glob(
                     f"{config.model.name}-fold{config.n_splits}-{fold}*"
                 )
             )

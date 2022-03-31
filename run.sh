@@ -2,7 +2,7 @@
 
 echo ' ####### start to train ######## '
 
-FILE_NAME=exp/exp000.py
+FILE_NAME=exp/exp001-v2.py
 
 if [ $1 = "debug" ]; then
         python $FILE_NAME \
