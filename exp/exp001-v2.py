@@ -41,7 +41,7 @@ from typing_extensions import Literal
 
 config: DictConfig = OmegaConf.create(
     dict(
-        exp_desc="exp000-batch512-emb1536-efficientnet_b7-large-backfindata",
+        exp_desc="exp001-batch512-emb1024-convnext-large-in22k-large-backfin-aug-v2-newlabel-warm-onecyle-3",
         train=True,
         debug=False,
         train_fold=[0, 1, 2, 3, 4],
@@ -58,17 +58,17 @@ config: DictConfig = OmegaConf.create(
         wandb_project="HappyWhale",
         model=dict(
             # name="tf_efficientnet_b7_ns",
-            name="efficientnet_b7",
+            # name="efficientnet_b6",
             # name="convnext_small",
             # name="convnext_small_in22ft1k",
             # name="convnext_large",
-            # name="convnext_large_in22ft1k",
+            name="convnext_large_in22ft1k",
             # name="swin_large_patch4_window7_224",
             # name="swin_base_patch4_window12_384_in22k",
             # name="beit_base_patch16_224_in22k",
             pretrained=True,
-            embedding_size=512,
-            arc_params=dict(s=10.0, m=0.50, ls_eps=0.0, easy_margin=False),
+            embedding_size=512 * 2,
+            arc_params=dict(s=20.0, m=0.50, ls_eps=0.0, easy_margin=False),
         ),
         trainer=dict(
             gpus=1,
@@ -85,17 +85,17 @@ config: DictConfig = OmegaConf.create(
             flush_logs_every_n_steps=10,
             profiler="simple",
             deterministic=False,
-            benchmark=False,
+            benchmark=True,
             weights_summary="top",
             reload_dataloaders_every_epoch=True,
             auto_scale_batch_size="binsearch",
-            auto_lr_find=True,
-            max_epochs=30,
+            auto_lr_find=False,
+            max_epochs=15,
             stochastic_weight_avg=False,
             # amp_backend="native",
             # amp_level="02",
         ),
-        batch_size=16,
+        batch_size=30,
         train_loader=dict(shuffle=True, num_workers=4, pin_memory=True, drop_last=True),
         val_loader=dict(
             shuffle=False,
@@ -111,17 +111,19 @@ config: DictConfig = OmegaConf.create(
         ),
         # optimizer=dict(name="optim.AdamW", params=dict(lr=5e-4)),
         optimizer=dict(name="optim.AdamW", default_lr=3e-4, params=dict(weight_decay=1e-6)),
+        # optimizer=dict(name="optim.Adam", default_lr=1e-2, params=dict(weight_decay=1e-6)),
         scheduler=dict(
             name="optim.lr_scheduler.CosineAnnealingLR",
-            params=dict(T_max=30),
+            # params=dict(T_max=15, eta_min=3e-5),
+            params=dict(T_max=15),
             # name="optim.lr_scheduler.OneCycleLR",
-            # params=dict(epochs=30),
         ),
         loss="nn.CrossEntropyLoss",
         callbacks=dict(
             monitor_metric="val_loss",
             mode="min",
-            patience=5,
+            patience=10,
+            # patience=5,
         ),
     )
 )
@@ -224,8 +226,10 @@ def encode_ids(df: pd.DataFrame, config: DictConfig, le_encoder: LabelEncoder, s
     if save:
         pickle_data_path = Path(config.output_path) / "backfin-le"
         logger.info(f"saved label encocder: {pickle_data_path}")
-        np.save(pickle_data_path, le_encoder.classes_)
-        logger.info(f"claases: {len(le_encoder.classes_)}")
+        # classes = np.concatenate([np.array(["new_individual"]), le_encoder.classes_])
+        classes = np.append(le_encoder.classes_, "new_individual")
+        np.save(pickle_data_path, classes)
+        logger.info(f"claases: {len(classes)}")
 
         # with pickle_data_path.open("wb") as f:
         # joblib.dump(le_encoder, f)
@@ -256,7 +260,17 @@ def get_transform(config: DictConfig) -> dict:
     transform = {
         "train": A.Compose(
             [
-                A.Resize(config.img_size, config.img_size, interpolation=cv2.INTER_CUBIC),
+                A.Rotate(limit=10, border_mode=cv2.BORDER_REPLICATE, p=0.5),
+                A.Cutout(num_holes=8, max_h_size=2, max_w_size=2, fill_value=0, p=0.5),
+                A.Cutout(num_holes=8, max_h_size=1, max_w_size=1, fill_value=1, p=0.5),
+                A.OneOf(
+                    [
+                        # A.augmentations.crops.transforms.CenterCrop(config.img_size, config.img_size),
+                        A.augmentations.crops.transforms.RandomResizedCrop(config.img_size, config.img_size),
+                    ],
+                    p=0.5,
+                ),
+                # A.augmentations.geometric.rotate.Rotate(limit=30, interpolation=cv2.INTER_CUBIC, p=0.5),
                 A.HorizontalFlip(p=0.5),
                 A.Normalize(
                     mean=[0.485, 0.456, 0.406],
@@ -264,36 +278,37 @@ def get_transform(config: DictConfig) -> dict:
                     max_pixel_value=255.0,
                     p=1.0,
                 ),
+                A.OneOf([A.augmentations.transforms.Blur(p=0.3), A.augmentations.transforms.MotionBlur(p=0.3)], p=0.3),
+                # A.augmentations.transforms.GaussNoise(p=0.5),
+                A.Resize(config.img_size, config.img_size, interpolation=cv2.INTER_CUBIC),
                 ToTensorV2(),
             ],
             p=1.0,
         ),
         "val": A.Compose(
             [
-                A.Resize(config.img_size, config.img_size, interpolation=cv2.INTER_CUBIC),
+                # A.augmentations.crops.transforms.CenterCrop(config.img_size, config.img_size),
                 A.Normalize(
                     mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225],
                     max_pixel_value=255.0,
                     p=1.0,
                 ),
+                A.Resize(config.img_size, config.img_size, interpolation=cv2.INTER_CUBIC),
                 ToTensorV2(),
             ],
             p=1.0,
         ),
         "test": A.Compose(
             [
-                A.Resize(
-                    config["img_size"],
-                    config["img_size"],
-                    interpolation=cv2.INTER_CUBIC,
-                ),
+                # A.augmentations.crops.transforms.CenterCrop(config.img_size, config.img_size),
                 A.Normalize(
                     mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225],
                     max_pixel_value=255.0,
                     p=1.0,
                 ),
+                A.Resize(config.img_size, config.img_size, interpolation=cv2.INTER_CUBIC),
                 ToTensorV2(),
             ],
             p=1.0,
@@ -444,9 +459,9 @@ def create_distances_df(image_names: np.ndarray, labels: np.ndarray, D: np.ndarr
             distance_df.append(subset_preds)
 
         distance_df = pd.DataFrame(distance_df).reset_index(drop=True)
-        logger.info(f"distance_df.head() = \n {distance_df.head()}")
         distance_df = distance_df.groupby(["image", "label"]).distnaces.max().reset_index(drop=True)
         distance_df = distance_df.sort_values("distances", ascending=False).reset_index(drop=True)
+        logger.info(f"distance_df.head() = \n {distance_df.head()}")
         return distance_df
 
     def _ref_code(image_names: np.ndarray, labels: np.ndarray, D: np.ndarray, I: np.ndarray) -> pd.DataFrame:
@@ -461,6 +476,7 @@ def create_distances_df(image_names: np.ndarray, labels: np.ndarray, D: np.ndarr
         distances_df = pd.concat(distances_df).reset_index(drop=True)
         distances_df = distances_df.groupby(["image", "label"]).distances.max().reset_index()
         distances_df = distances_df.sort_values("distances", ascending=False).reset_index(drop=True)
+        logger.info(f"distances_df.head() = \n {distances_df.head()}")
 
         return distances_df
 
@@ -486,16 +502,17 @@ def get_best_threshold(val_targets_df: pd.DataFrame, val_df: pd.DataFrame) -> Tu
             best_cv = cv
             best_thr = thr
 
-    logger.info(f"######### best_thr={best_thr:.2f}, best_cv={best_cv} ########## ")
-
     # Adjustment: Since Public lb has nearly 10% 'new_individual' (Be Careful for private LB)
     val_targets_df.loc[:, "is_new_individual"] = val_targets_df["label"] == "new_individual"
-    logger.info(f"val_target_df.head() = \n {val_targets_df.head()}")
     val_scores = val_targets_df.groupby("is_new_individual").mean().T
     val_scores.loc[:, "adjusted_cv"] = val_scores[True] * 0.1 + val_scores[False] * 0.9
-    logger.info(f"val_scores.head() = {val_scores.head()}")
     best_thr = val_scores["adjusted_cv"].idxmax()
+
+    logger.info(f"######### best_thr={best_thr:.2f}, best_cv={best_cv} ########## ")
+    logger.info(f"val_target_df.head() = \n {val_targets_df.head()}")
+    logger.info(f"val_scores.head() = {val_scores.head()}")
     logger.info(f"best_thr_adjusted = {best_thr}")
+
     return best_thr, best_cv
 
 
@@ -525,6 +542,8 @@ class HappyWhaleDataset(Dataset):
         self._mode = mode
         self._transform = transform
 
+        self._horizontal_flip = A.Compose([A.HorizontalFlip(p=1.0)])
+
         self._dtype = torch.float if config.trainer.precision == 32 else torch.half
 
     def __len__(self) -> int:
@@ -540,6 +559,12 @@ class HappyWhaleDataset(Dataset):
         org_img_path = self._images[idx]
         img = self.__get_img(img_path)
         label = self._labels[idx]
+
+        # make new label (new_individual)
+        # if torch.rand(1)[0] < 0.1:
+        #     img = self._horizontal_flip(image=img)["image"]
+        #     label = np.int32(15587 + 1)
+            # label = np.zeros(15587)
 
         if self._transform:
             img = self._transform[self._mode](image=img)["image"]
@@ -621,7 +646,6 @@ class GeM(nn.Module):
         return self.gem(x, p=self._p, eps=self._eps)
 
     def gem(self, x: torch.Tensor, p: nn.parameter.Parameter, eps: float = 1e-6) -> torch.Tensor:
-        # pdb.set_trace()
         return F.avg_pool2d(x.clamp(min=eps).pow(p), (x.size(-2), x.size(-1))).pow(1.0 / p)
 
     def __repr__(self) -> str:
@@ -713,10 +737,11 @@ class HappyWhaleModel(nn.Module):
         in_features = self.backbone.get_classifier().in_features
         # self.backbone.classifier = nn.Identity()
         # self.backbone.global_pool = nn.Identity()
-        self.drop = nn.Dropout(p=0.2, inplace=False)
+        self.drop = nn.Dropout(p=0.5, inplace=False)
         self.fc = nn.Linear(in_features, config.model.embedding_size)
         # self.fc = nn.LazyLinear(out_features=config.model.embedding_size)
         self.backbone.reset_classifier(num_classes=0, global_pool="avg")
+
         # self.pooling = GeM()
         self.arc = ArcMarginProduct(
             config.model.embedding_size,
@@ -728,8 +753,19 @@ class HappyWhaleModel(nn.Module):
             ls_eps=config.model.arc_params.ls_eps,
         )
 
-        self.norm1 = nn.BatchNorm1d(in_features)
-        self.norm2 = nn.BatchNorm1d(config.model.embedding_size)
+        self.norm1 = nn.BatchNorm1d(in_features, affine=False)
+        # self.norm1 = nn.LayerNorm(in_features)
+        # self.norm2 = nn.BatchNorm1d(config.model.embedding_size)
+
+    def freaze_layers(self):
+        logger.info(" ##### freeze layers ##### ")
+        for param in self.backbone.parameters():
+            param.require_grad = False
+
+    def unfreeze_layers(self):
+        logger.info(" ##### unfreeze layers ##### ")
+        for param in self.backbone.parameters():
+            param.require_grad = True
 
     def forward(self, images: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         features = self.backbone(images)
@@ -737,7 +773,7 @@ class HappyWhaleModel(nn.Module):
         features = self.norm1(features)
         features = self.drop(features)
         emb = self.fc(features)
-        emb = self.norm2(emb)
+        # emb = self.norm2(emb)
         output = self.arc(emb, labels)
         return output, emb
 
@@ -759,15 +795,17 @@ class MyLitModel(pl.LightningModule):
         self._transform = get_transform(config)
         self._dtype = torch.float if config.trainer.precision == 32 else torch.half
         self.__build_model()
-        self.save_hyperparameters()
 
         # settings of wandb logger
         self.monitor_metric = config.callbacks.monitor_metric
         self.monitor_mode = config.callbacks.mode
-        self.logger_cnt = 0
+        self.logger_flag = True
+        self.unfreeze_flag = True
 
         # self._le = self.__load_le()
         self._test_preds_df_path = config.data_path + "/test/test.csv"
+
+        self.save_hyperparameters()
 
     def __build_model(self) -> None:
         self.model = HappyWhaleModel(
@@ -775,14 +813,20 @@ class MyLitModel(pl.LightningModule):
             config=self._config,
             pretrained=self._config.model.pretrained,
         )
+        self.model.freaze_layers()
 
     def forward(self, images: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.model(images, labels)
 
     def training_step(self, batch: dict, batch_idx: int) -> dict:
-        if self.global_step == 0 and self.logger_cnt == 0:
+        if self.global_step == 0 and self.logger_flag:
             self.logger.experiment.define_metric(self.monitor_metric, summary=self.monitor_mode)
-            self.logger_cnt += 1
+            self.logger_flag = False
+
+        if self.current_epoch > 5 and self.unfreeze_flag:
+            self.model.unfreeze_layers()
+            # self.hparams.learning_rate = self.hparams.learning_rate / 10
+            self.unfreeze_flag = False
 
         loss, pred, labels, img_path, idx, emb = self.__share_step(batch, "train")
         return {
@@ -840,7 +884,7 @@ class MyLitModel(pl.LightningModule):
         labels = torch.cat(labels)
         metric = F.cross_entropy(preds.float(), labels.long())
         if mode == "train":
-            self.log(f"fold{config.fold}_train_loss", metric)
+            self.log(f"fold{self._config.fold}_train_loss", metric)
         elif mode == "val":
             self.log(self._config.callbacks.monitor_metric, metric)
 
@@ -862,10 +906,27 @@ class MyLitModel(pl.LightningModule):
             self.hparams.learning_rate,
             **self._config.optimizer.params,
         )
-        scheduler = eval(self._config.scheduler.name)(
-            optimizer,
-            **self._config.scheduler.params,
-        )
+        if self._config.scheduler.name == "optim.lr_scheduler.OneCycleLR":
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer=optimizer,
+                max_lr=self.hparams.learning_rate,
+                # steps_per_epoch=(self.hparams.len_train_dl//self.hparams.batch_size)//self.trainer.accumulate_grad_batches,
+                steps_per_epoch=(
+                    self.hparams.len_train_dl // int(self.hparams.batch_size * self.trainer.accumulate_grad_batches)
+                ),
+                pct_start=(3 / self.trainer.max_epochs),
+                epochs=self.trainer.max_epochs,
+                anneal_strategy="cos",
+                # div_factor=25,  # init_lr = max_lr / div_factor
+                div_factor=10,  # init_lr = max_lr / div_factor
+                verbose=False,
+            )
+            scheduler = {"scheduler": scheduler, "interval": "step"}
+        else:
+            scheduler = eval(self._config.scheduler.name)(
+                optimizer,
+                **self._config.scheduler.params,
+            )
         return [optimizer], [scheduler]
 
 
@@ -927,7 +988,11 @@ def train(
 
     trainer = pl.Trainer(
         logger=pl_logger,
-        callbacks=[lr_monitor, loss_checkpoint, earystopping],
+        callbacks=[
+            lr_monitor,
+            loss_checkpoint,
+            earystopping
+        ],
         **config.trainer,
     )
 
@@ -1007,17 +1072,23 @@ def infer(
     train_embs = np.concatenate([train_embs, val_embs])
     train_labels = np.concatenate([train_labels, val_labels])
 
+    emb_path = Path(config.output_path) / str(Path(__file__).stem) / f"fold{fold}-embs"
+    np.save(emb_path, train_embs)
+
+    # seach index from test embeddings
     D, I = create_and_search_index(module.embedding_size, train_embs, test_embs, k)
     test_df = create_distances_df(test_img_name, train_labels, D, I)
     predictions = create_predictions_df(test_df, best_thr)
-
     logger.info(f"prediciotns_df \n{predictions.head()}")
 
     public_predicitons_path = Path("./input") / "0-720-eff-b5-640-rotate" / "submission.csv"
     public_predictions = pd.read_csv(public_predicitons_path)
+
     ids_without_backfin_path = Path("./input") / "ids-without-backfin" / "ids_without_backfin.npy"
     ids_without_backfin = np.load(ids_without_backfin_path, allow_pickle=True)
+
     ids2 = public_predictions["image"][~public_predictions["image"].isin(predictions["image"])]
+
     predictions = pd.concat(
         [
             predictions[~(predictions["image"].isin(ids_without_backfin))],
@@ -1085,7 +1156,10 @@ def main(config: DictConfig) -> None:
         val_df = df[df["fold"] == fold]
         test_df = get_df(config, mode="test")
 
-        plot_dist(label=val_df["individual_id"].values, save_name=config.output_path + f"/fold{fold}-dist.png")
+        plot_dist(
+            label=val_df["individual_id"].values,
+            save_name=config.output_path + f"/fold{fold}-dist.png",
+        )
 
         if config.train and fold in config.train_fold:
             logger.info("#" * 8 + f"  Fold: {fold}  " + "#" * 8)
@@ -1094,7 +1168,7 @@ def main(config: DictConfig) -> None:
         if config.inference:
             # inference関数を実装する
             checkpoint_path = list(
-                (Path(config.output_path) / "checkpoiints" / config.model.name / config.exp_desc).glob(
+                (Path(config.output_path) / "checkpoints" / config.model.name / config.exp_desc).glob(
                     f"{config.model.name}-fold{config.n_splits}-{fold}*"
                 )
             )

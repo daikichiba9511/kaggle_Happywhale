@@ -5,18 +5,26 @@ Reference
 * https://www.kaggle.com/code/yamsam/simple-ensemble-of-public-best-kernels
 """
 import csv
-import pandas as pd
 import pprint
+from functools import partial
+from itertools import chain
+from typing import Any, Dict, List, Optional
 
-from typing import Optional, List, Dict, Any
-
+import pandas as pd
 
 sub_files = [
-    "output/exp000/convnext-large-in22k-makesub/fold0-submission.csv",
-    "output/exp000/convnext-large-in22k-makesub/fold1-submission.csv",
-    "output/exp000/convnext-large-in22k-makesub/fold2-submission.csv",
-    "output/exp000/convnext-large-in22k-makesub/fold3-submission.csv",
-    "output/exp000/convnext-large-in22k-makesub/fold4-submission.csv",
+    # "output/exp011-img736-all/fold0_submission.csv",
+    # "output/exp011-img736-all/fold1_submission.csv",
+    # "output/exp011-img736-all/fold2_submission.csv",
+    # "output/exp011-img736-all/fold3_submission.csv",
+    # "output/exp011-img736-all/fold4_submission.csv",
+    # "./sub_ens_tf-eff07.csv",
+    # "./sub_ens_convnext-large.csv",
+    "output/exp012/fold0_submission.csv",
+    "output/exp012/fold1_submission.csv",
+    "output/exp012/fold2_submission.csv",
+    "output/exp012/fold3_submission.csv",
+    "output/exp012/fold4_submission.csv",
 ]
 
 
@@ -24,13 +32,17 @@ print("sub_files = \n ")
 pprint.pprint(sub_files)
 
 
+# sub_weights = [0.753, 0.755]
 sub_weights = [
-    (10.0 - 9.544) ** 2,
-    (10.0 - 9.570) ** 2,
-    (10.0 - 9.563) ** 2,
-    (10.0 - 9.610) ** 2,
-    (10.0 - 9.596) ** 2,
+    0.80014030864,
+    0.8070394868711886,
+    0.800140308679094,
+    0.8054319502906393,
+    0.814126774115949,
 ]
+
+print("cv mean score: ", sum(sub_weights) / len(sub_weights))
+sub_weights = list(map(lambda x: x ** 2, sub_weights))
 
 
 h_label = "image"
@@ -56,10 +68,8 @@ for p, row in enumerate(sub[0]):
     target_weight: Dict[str, Any] = {}
     for s in range(num_sub_files):
         row1 = sub[s][p]
-        for idx, target in enumerate(row[h_target].split(" ")):
-            target_weight[target] = target_weight.get(target, 0) + (
-                place_wights[idx] * sub_weights[s]
-            )
+        for idx, target in enumerate(row1[h_target].split(" ")):
+            target_weight[target] = target_weight.get(target, 0) + (place_wights[idx] * sub_weights[s])
     tops_target = sorted(target_weight, key=target_weight.get, reverse=True)[:npt]
     writer.writerow([row1[h_label], " ".join(tops_target)])
 out.close

@@ -134,3 +134,7 @@ output
 
 wandb_logs
 wandb
+
+lightning_logs
+*.csv
+*.npy
