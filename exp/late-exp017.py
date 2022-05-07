@@ -232,9 +232,11 @@ class ArcMarginProduct(nn.Module):
         in_features: int,
         out_features: int,
         s: float,
-        m: float,
+        m: np.ndarray,
         easy_margin: bool,
         ls_eps: float,
+        dtype=torch.float16,
+        device="cuda",
     ):
         super(ArcMarginProduct, self).__init__()
         self.in_features = in_features
@@ -246,10 +248,10 @@ class ArcMarginProduct(nn.Module):
         nn.init.xavier_uniform_(self.weight)
 
         self.easy_margin = easy_margin
-        self.cos_m = math.cos(m)
-        self.sin_m = math.sin(m)
-        self.th = math.cos(math.pi - m)
-        self.mm = math.sin(math.pi - m) * m
+        self.cos_m = torch.from_numpy(np.cos(m)).float().to(dtype=dtype, device=device)
+        self.sin_m = torch.from_numpy(np.sin(m)).float().to(dtype=dtype, device=device)
+        self.th = torch.from_numpy(np.cos(math.pi - m)).float().to(dtype=dtype, device=device)
+        self.mm = torch.from_numpy(np.sin(math.pi - m) * m).float().to(dtype=dtype, device=device)
 
     def forward(self, input: torch.Tensor, label: torch.Tensor, device: str = "cuda") -> torch.Tensor:
         # --------------------------- cos(theta) & phi(theta) ---------------------
@@ -327,20 +329,18 @@ class LitModule(pl.LightningModule):
             ls_eps=arc_ls_eps,
         )
 
-        self.freeze_layers()
+        self.freeze_bn_layers()
 
-    def freeze_layers(self):
+    def freeze_bn_layers(self):
         print(" ##### freeze layers ##### ")
         for param in self.model.parameters():
-            param.require_grad = False
+            if isinstance(param, nn.BatchNorm1d):
+                param.require_grad = False
 
     def unfreeze_layers(self):
         print(" ##### unfreeze layers ##### ")
         for param in self.model.parameters():
-            if isinstance(param, nn.BatchNorm1d):
-                param.require_grad = False
-            else:
-                param.require_grad = True
+            param.require_grad = True
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         features = self.model(images)
@@ -351,8 +351,17 @@ class LitModule(pl.LightningModule):
         return embeddings
 
     def configure_optimizers(self):
+        params = list(self.named_parameters())
+
+        def is_head(n):
+            return "arc" in n
+
+        g_params = [
+            {"params": [p for n, p in params if not is_head(n)], "lr": self.hparams.learning_rate},
+            {"params": [p for n, p in params if is_head(n)], "lr": self.hparams.learning_rate * 10.0},
+        ]
         optimizer = create_optimizer_v2(
-            self.parameters(),
+            g_params,
             opt=self.hparams.optimizer,
             lr=self.hparams.learning_rate,
             weight_decay=self.hparams.weight_decay,
@@ -805,7 +814,7 @@ def infer(
     predictions.to_csv(sub_path, index=False)
 
 
-def get_dynamic_margins(value_counts: np.ndarray, a: float = 0.40, b: float = 0.05):
+def get_dynamic_margins(value_counts: pd.Series, a: float = 0.40, b: float = 0.05):
     """
 
     Ref:
@@ -815,8 +824,7 @@ def get_dynamic_margins(value_counts: np.ndarray, a: float = 0.40, b: float = 0.
     """
     dynamic_margins = value_counts ** -0.25
     dynamic_margins = a * dynamic_margins + b
-    dynamic_margins = torch.tensor(dynamic_margins, requires_grad=False)
-    return dynamic_margins
+    return dynamic_margins.to_numpy()
 
 
 def main():
@@ -829,13 +837,13 @@ def main():
     # train_folds = [0, 1, 2, 3, 4]
 
     # model_name = "tf_efficientnet_b7"
-    # model_name = "tf_efficientnet_b7_ns"
-    model_name = "tf_efficientnet_l2_ns"
+    model_name = "tf_efficientnet_b7_ns"
+    # model_name = "tf_efficientnet_l2_ns"
     # model_name = "convnext_base_384_in22ft1k"
     image_size = 512
-    batch_size = 2
+    batch_size = 8
     n_fold = 5
-    max_epochs = 20
+    max_epochs = 10
     warm_start_path = None
 
     for val_fold in range(n_fold):
@@ -855,12 +863,12 @@ def main():
                 max_epochs=max_epochs,
                 warm_start_path=warm_start_path,
                 stochastic_weight_avg=False,
-                accumulate_grad_batches=8,
-                arc_s=15,
-                arc_m=0.3,
+                accumulate_grad_batches=2,
+                arc_s=20,
+                arc_m=dynamic_margins,
                 learning_rate=3e-4,
                 gradient_clip_val=0.5,
-                embedding_size=2048,
+                embedding_size=512 * 4,
                 optimizer="adamw",
             )
             torch.cuda.empty_cache()
